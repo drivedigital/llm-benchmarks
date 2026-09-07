@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   Cpu,
   FlaskConical,
@@ -35,6 +36,7 @@ export default function App() {
     connection,
     runs,
     paused,
+    executionError,
     pass,
     passTotal,
     passCompleted,
@@ -171,6 +173,16 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {executionError && (
+          <div
+            role="alert"
+            className="mb-4 flex items-start gap-2 rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-300"
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <p>{executionError}</p>
+          </div>
+        )}
 
         {/* Stat cards */}
         <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">

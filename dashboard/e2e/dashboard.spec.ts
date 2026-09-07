@@ -11,6 +11,14 @@ test("starts blank, stays idle, and has one combined settings button", async ({
   });
   await page.clock.install();
   await page.goto("/");
+  if (testInfo.project.name === "http-lan") {
+    expect(
+      await page.evaluate(() => ({
+        secure: isSecureContext,
+        uuid: typeof crypto.randomUUID,
+      })),
+    ).toEqual({ secure: false, uuid: "undefined" });
+  }
   await expect(
     page.getByText("Benchmarks idle", { exact: true }),
   ).toBeVisible();
@@ -155,4 +163,66 @@ test("only explicit API requests populate results; purge returns to a stable emp
   await expect(page.getByRole("button", { name: "Purge data" })).toBeDisabled();
   expect(completions).toBe(1);
   expect(pageErrors).toEqual([]);
+});
+
+test("Start benchmarks dispatches completions and Pause stops new requests", async ({
+  page,
+}) => {
+  const completions: Record<string, unknown>[] = [];
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/v1/models", (route) =>
+    route.fulfill({ json: { data: [{ id: "test-context/rotation-model" }] } }),
+  );
+  await page.route("**/api/v1/chat/completions", async (route) => {
+    completions.push(route.request().postDataJSON());
+    await gate;
+    await route.fulfill({
+      json: {
+        choices: [{ message: { content: "Rotation API fixture response." } }],
+        usage: { completion_tokens: 5 },
+      },
+    });
+  });
+  await page.clock.install();
+  await page.goto("/");
+  await page.getByRole("button", { name: /Server & models/ }).click();
+  await page.getByRole("button", { name: "Test connection" }).click();
+  await expect(page.getByRole("status")).toContainText(
+    "Connected — 1 model(s)",
+  );
+  await page.getByRole("button", { name: "Close dialog" }).click();
+  await page.getByRole("button", { name: "Start benchmarks" }).click();
+  await page.clock.runFor(1000);
+  await expect.poll(() => completions.length).toBe(2);
+  expect(completions).toEqual([
+    expect.objectContaining({
+      model: "test-context/rotation-model",
+      stream: true,
+      max_tokens: 620,
+    }),
+    expect.objectContaining({
+      model: "test-context/rotation-model",
+      stream: true,
+      max_tokens: 540,
+    }),
+  ]);
+  await expect(page.getByText(/0\/3 combinations complete/)).toContainText(
+    "2 API requests in flight",
+  );
+  await page.getByRole("button", { name: "Pause rotation" }).click();
+  release();
+  await expect(page.getByText(/2\/3 combinations complete/)).toContainText(
+    "0 API requests in flight",
+  );
+  await expect(page.locator("button.animate-feedin")).toHaveCount(2);
+  await expect(page.getByText("Idle", { exact: true })).toBeVisible();
+  await page.clock.fastForward(10_000);
+  expect(completions).toHaveLength(2);
+  expect(pageErrors).toEqual([]);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });

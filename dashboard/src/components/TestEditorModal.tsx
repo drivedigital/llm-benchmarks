@@ -9,6 +9,7 @@ import {
 import Modal from "./Modal";
 import { testReadinessError } from "../lib/testReadiness";
 import type { TestDef } from "../types";
+import { createLocalId } from "../utils/id";
 
 export default function TestEditorModal({
   open,
@@ -31,7 +32,7 @@ export default function TestEditorModal({
 }) {
   const [expanded, setExpanded] = useState<string | null>(tests[0]?.id ?? null);
   function handleAdd() {
-    const id = crypto.randomUUID();
+    const id = createLocalId();
     onAddTest({
       id,
       code: `CUSTOM_${tests.length + 1}`,

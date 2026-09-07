@@ -56,6 +56,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("real-only benchmark session", () => {
@@ -84,6 +85,160 @@ describe("real-only benchmark session", () => {
     });
     await tick();
     expect(result.current.runs).toEqual([]);
+  });
+
+  it.each(["ad-hoc", "rotation"])(
+    "dispatches %s requests on HTTP LAN pages without crypto.randomUUID",
+    async (mode) => {
+      vi.stubGlobal("crypto", {});
+      const { result } = renderHook(useBenchSession);
+      await connect(result);
+      act(() => {
+        if (mode === "ad-hoc")
+          expect(result.current.runAdHoc("actual-model", "t1_code")).toBe(true);
+        else result.current.togglePaused();
+      });
+      await tick();
+      const expectedCount = mode === "ad-hoc" ? 1 : 2;
+      expect(stream).toHaveBeenCalledTimes(expectedCount);
+      expect(result.current.runs).toHaveLength(expectedCount);
+      expect(new Set(result.current.runs.map((run) => run.id)).size).toBe(
+        expectedCount,
+      );
+      expect(
+        result.current.runs.every(
+          (run) => run.id.startsWith("local-") && run.status === "running",
+        ),
+      ).toBe(true);
+      expect(result.current.executionError).toBeNull();
+      await act(async () =>
+        pending.forEach((request) => request.resolve(measured)),
+      );
+      expect(
+        result.current.runs.every(
+          (run) =>
+            run.status === "success" && run.response === measured.response,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("creates custom test IDs without secure-context crypto APIs", () => {
+    vi.stubGlobal("crypto", undefined);
+    const { result } = renderHook(useBenchSession);
+    act(() =>
+      result.current.addTest({
+        code: "CUSTOM",
+        name: "LAN custom test",
+        category: "text",
+        objective: "A real prompt",
+        prompt: "Say hello",
+        maxTokens: 10,
+      }),
+    );
+    expect(
+      result.current.tests.find((test) => test.name === "LAN custom test")?.id,
+    ).toMatch(/^local-/);
+    expect(result.current.runs).toEqual([]);
+  });
+
+  it.each(["ad-hoc", "rotation"])(
+    "surfaces %s setup failures without recording fake runs or losing a queued test",
+    async (mode) => {
+      const { result } = renderHook(useBenchSession);
+      await connect(result);
+      const failingId = vi.fn(() => {
+        throw new Error("Browser ID failure");
+      });
+      vi.stubGlobal("crypto", { randomUUID: failingId });
+      act(() => {
+        if (mode === "ad-hoc")
+          expect(result.current.runAdHoc("actual-model", "t1_code")).toBe(
+            false,
+          );
+        else result.current.togglePaused();
+      });
+      await tick(5000);
+      expect(failingId).toHaveBeenCalledOnce();
+      expect(result.current.executionError).toContain("Browser ID failure");
+      expect(result.current.executionError).toContain(
+        "No API request was sent",
+      );
+      expect(result.current.paused).toBe(true);
+      expect(result.current.runningCount).toBe(0);
+      expect(result.current.runs).toEqual([]);
+      expect(stream).not.toHaveBeenCalled();
+      expect(result.current.connection.status).toBe("connected");
+
+      vi.stubGlobal("crypto", {});
+      act(() => {
+        if (mode === "ad-hoc")
+          result.current.runAdHoc("actual-model", "t1_code");
+        else result.current.togglePaused();
+      });
+      await tick();
+      expect(result.current.executionError).toBeNull();
+      expect(stream.mock.calls[0][0]).toMatchObject({
+        modelId: "actual-model",
+        prompt: result.current.tests[0].prompt,
+      });
+      if (mode === "rotation") expect(result.current.passTotal).toBe(3);
+    },
+  );
+
+  it("reports unexpected client rejections, frees capacity, and ignores stale failures after purge", async () => {
+    const { result } = renderHook(useBenchSession);
+    await connect(result);
+    act(() => {
+      result.current.runAdHoc("actual-model", "t1_code");
+    });
+    const signal = stream.mock.calls[0][0].signal;
+    await act(async () => {
+      pending[0].reject(new Error("Unexpected browser exception"));
+    });
+    expect(signal.aborted).toBe(true);
+    expect(result.current.paused).toBe(true);
+    expect(result.current.runs).toEqual([]);
+    expect(result.current.runningCount).toBe(0);
+    expect(result.current.executionError).toContain(
+      "Unexpected browser exception",
+    );
+    expect(result.current.canRunAdHoc).toBe(true);
+    act(() => {
+      expect(result.current.runAdHoc("actual-model", "t1_code")).toBe(true);
+    });
+    expect(result.current.executionError).toBeNull();
+    act(() => result.current.purgeRuns());
+    await act(async () => {
+      pending[1].reject(new Error("Late cancelled client failure"));
+    });
+    expect(result.current.runs).toEqual([]);
+    expect(result.current.executionError).toBeNull();
+  });
+
+  it("retries the same rotation combination after an unexpected client failure", async () => {
+    const { result } = renderHook(useBenchSession);
+    await connect(result);
+    act(() => result.current.togglePaused());
+    await tick();
+    await act(async () => {
+      pending[0].reject(new Error("Unexpected client failure"));
+      pending[1].resolve(measured);
+    });
+    expect(result.current.paused).toBe(true);
+    expect(result.current.runs).toHaveLength(1);
+    expect(result.current.passCompleted).toBe(1);
+    act(() => result.current.togglePaused());
+    await tick();
+    expect(stream.mock.calls[2][0].prompt).toBe(result.current.tests[0].prompt);
+    expect(stream.mock.calls[3][0].prompt).toBe(result.current.tests[2].prompt);
+    await act(async () => {
+      pending[2].resolve(measured);
+      pending[3].resolve(measured);
+    });
+    expect(result.current.runs).toHaveLength(3);
+    expect(result.current.passCompleted).toBe(3);
+    expect(result.current.executionError).toBeNull();
   });
 
   it("stays empty when the connection fails", async () => {

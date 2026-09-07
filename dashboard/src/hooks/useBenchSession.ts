@@ -3,6 +3,7 @@ import { DEFAULT_TESTS } from "../data/tests";
 import { DEFAULT_BASE_URL, normalizeBaseUrl } from "../lib/apiConfig";
 import { probeModels, streamChatCompletion } from "../lib/liveRunner";
 import { isRunnableTest } from "../lib/testReadiness";
+import { createLocalId } from "../utils/id";
 import type { ConnectionState, ModelDef, RunResult, TestDef } from "../types";
 
 const MAX_CONCURRENT = 2;
@@ -40,6 +41,7 @@ export function useBenchSession() {
   });
   const [runs, setRuns] = useState<RunResult[]>([]);
   const [paused, setPaused] = useState(true);
+  const [executionError, setExecutionError] = useState<string | null>(null);
   const [pass, setPass] = useState(0);
   const [passTotal, setPassTotal] = useState(0);
   const [passCompleted, setPassCompleted] = useState(0);
@@ -108,11 +110,24 @@ export function useBenchSession() {
       );
       if (!model || !test) return false;
 
-      const runId = crypto.randomUUID();
+      // Browser capability/setup failures happen before dispatch and must not
+      // silently kill the click handler or become fabricated API run results.
+      let runId: string;
+      let controller: AbortController;
+      try {
+        runId = createLocalId();
+        controller = new AbortController();
+      } catch (error) {
+        pauseRotation();
+        setExecutionError(
+          `Could not start the benchmark: ${error instanceof Error ? error.message : "Unknown browser error"}. No API request was sent for this attempt. Retry or reload the dashboard.`,
+        );
+        return false;
+      }
+      setExecutionError(null);
       const startedAt = Date.now();
       const epoch = epochRef.current;
       const baseUrl = connectionRef.current.baseUrl;
-      const controller = new AbortController();
       const timer = window.setTimeout(
         () => controller.abort("live-timeout"),
         LIVE_RUN_TIMEOUT_MS,
@@ -183,6 +198,24 @@ export function useBenchSession() {
             setPassCompleted((count) => count + 1);
           }
         })
+        .catch((error: unknown) => {
+          if (epoch !== epochRef.current) return;
+          // API failures normally resolve as LiveOutcome. An unexpected client
+          // exception has no trustworthy result: cancel and surface it instead
+          // of leaving a permanently "running" row or inventing measurements.
+          controller.abort("client-error");
+          if (
+            rotationPassId !== undefined &&
+            rotationPassId === passIdRef.current
+          ) {
+            queueRef.current.unshift(combo);
+          }
+          pauseRotation();
+          setRuns((previous) => previous.filter((run) => run.id !== runId));
+          setExecutionError(
+            `The browser could not complete the benchmark: ${error instanceof Error ? error.message : "Unknown browser error"}. The attempt was cancelled and no result was recorded. Retry or reload the dashboard.`,
+          );
+        })
         .finally(() => {
           window.clearTimeout(timer);
           // An old request must not decrement the capacity of a new session after purge.
@@ -226,6 +259,12 @@ export function useBenchSession() {
       ) {
         const combo = queueRef.current.shift()!;
         if (!startRun(combo, passIdRef.current)) {
+          if (pausedRef.current) {
+            // A setup error pauses rotation. Keep this combination for a user-
+            // initiated retry rather than silently discarding queued tests.
+            queueRef.current.unshift(combo);
+            break;
+          }
           // Disabled/removed models and incomplete tests are skipped, not recorded.
           setPassTotal((total) => Math.max(0, total - 1));
         }
@@ -250,6 +289,7 @@ export function useBenchSession() {
       connectionRef.current.status === "connected" &&
       buildMatrix(modelsRef.current, testsRef.current).length > 0
     ) {
+      setExecutionError(null);
       pausedRef.current = false;
       setPaused(false);
     }
@@ -259,6 +299,7 @@ export function useBenchSession() {
   const purgeRuns = useCallback(() => {
     clearActive("purge");
     resetRotation();
+    setExecutionError(null);
     setRuns([]);
   }, [clearActive, resetRotation]);
 
@@ -317,7 +358,7 @@ export function useBenchSession() {
 
   const addTest = useCallback(
     (test: Omit<TestDef, "id"> & { id?: string }) => {
-      const id = test.id ?? crypto.randomUUID();
+      const id = test.id ?? createLocalId();
       if (testsRef.current.some((t) => t.id === id)) return;
       replaceTests([...testsRef.current, { ...test, id, custom: true }]);
     },
@@ -391,6 +432,7 @@ export function useBenchSession() {
         urlOverride ?? connectionRef.current.baseUrl,
       );
       updateBaseUrl(baseUrl);
+      setExecutionError(null);
       pauseRotation();
       const probeId = ++probeIdRef.current;
       probeControllerRef.current?.abort("new-probe");
@@ -450,6 +492,7 @@ export function useBenchSession() {
     connection,
     runs,
     paused,
+    executionError,
     pass,
     passTotal,
     passCompleted,

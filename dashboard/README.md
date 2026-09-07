@@ -29,6 +29,18 @@ benchmark requests, running animation, or automatic rotation. The included
 text prompts are editable _test definitions_, not completed tests or results.
 Even a successful connection check **does not start benchmarks**.
 
+### Opening the dashboard over HTTP on your LAN
+
+A URL such as `http://<dashboard-host>:5173` is supported. Unlike localhost or
+HTTPS, ordinary HTTP LAN pages do not expose `crypto.randomUUID()`. Internal
+run and custom-test IDs use a page-local fallback when that API is unavailable;
+this does not change the model IDs sent to Jan or generate benchmark data.
+
+If a browser-side error prevents a request from starting, the dashboard shows
+an error banner and pauses rotation instead of silently ignoring the action.
+Unstarted or failed client-side attempts do not become benchmark measurements.
+After updating, reload the page so it uses the new client code.
+
 ## Server URL and proxy
 
 Browser requests use the same-origin `/api` proxy. Its default upstream is
@@ -141,6 +153,9 @@ The tests cover blank startup, no automatic probes/runs, failed connections,
 explicit execution, truthful missing metrics, model discovery, request limits,
 stream parsing, cancellations, stale probes, and purging without late results
 reappearing. Browser fixtures never become user-visible benchmark data.
+The browser suite runs on both localhost and a genuinely non-secure HTTP
+hostname (resolved to the test server only inside Chromium), covering ad-hoc
+execution and rotation without secure-context-only browser APIs.
 
 ### Optional API contract fixture
 

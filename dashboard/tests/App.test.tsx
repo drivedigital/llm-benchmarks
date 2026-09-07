@@ -83,6 +83,46 @@ describe("dashboard activity reflects actual requests", () => {
     ).toBeTruthy();
   });
 
+  it("displays pre-dispatch errors visibly rather than leaving Run now silent", async () => {
+    render(<App />);
+    await connect();
+    fireEvent.change(screen.getByLabelText("Ad-hoc model"), {
+      target: { value: "actual-jan-model" },
+    });
+    fireEvent.change(screen.getByLabelText("Ad-hoc test"), {
+      target: { value: "t1_code" },
+    });
+    vi.stubGlobal("crypto", {
+      randomUUID: () => {
+        throw new Error("Browser ID failure");
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run now" }));
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Could not start the benchmark: Browser ID failure",
+    );
+    expect(screen.getByRole("alert").textContent).toContain(
+      "No API request was sent",
+    );
+    expect(screen.getByText("0 API requests in flight")).toBeTruthy();
+    expect(screen.getByText(/No runs yet/)).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1); // Only the successful connection probe.
+  });
+
+  it("can add test definitions without randomUUID on an HTTP LAN page", () => {
+    vi.stubGlobal("crypto", {});
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit tests" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add test" }));
+    expect(screen.getByDisplayValue("New custom test")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("switch", { name: "Enable New custom test" })
+        .getAttribute("aria-checked"),
+    ).toBe("false");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("shows a failed probe without runs, metrics, fake live indicators, or enabled run buttons", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Server & models/ }));
