@@ -1,37 +1,4 @@
-import { useEffect, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
-
-function useAnimatedNumber(target: number, duration = 700) {
-  const [value, setValue] = useState(target);
-  const fromRef = useRef(target);
-  const startRef = useRef<number | null>(null);
-  const frameRef = useRef<number>(0);
-
-  useEffect(() => {
-    fromRef.current = value;
-    startRef.current = null;
-    const from = value;
-    const delta = target - from;
-    if (Math.abs(delta) < 0.001) {
-      setValue(target);
-      return;
-    }
-    function step(ts: number) {
-      if (startRef.current === null) startRef.current = ts;
-      const progress = Math.min(1, (ts - startRef.current) / duration);
-      const eased = 1 - (1 - progress) * (1 - progress);
-      setValue(from + delta * eased);
-      if (progress < 1) {
-        frameRef.current = requestAnimationFrame(step);
-      }
-    }
-    frameRef.current = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(frameRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target]);
-
-  return value;
-}
 
 export default function StatCard({
   label,
@@ -44,7 +11,7 @@ export default function StatCard({
   pulse,
 }: {
   label: string;
-  value: number;
+  value?: number;
   suffix?: string;
   digits?: number;
   icon: LucideIcon;
@@ -52,8 +19,7 @@ export default function StatCard({
   sublabel?: string;
   pulse?: boolean;
 }) {
-  const animated = useAnimatedNumber(value);
-
+  const hasValue = value !== undefined && Number.isFinite(value);
   return (
     <div className="group relative overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03] p-4 shadow-lg shadow-black/20 backdrop-blur transition hover:border-white/20">
       <div
@@ -74,11 +40,15 @@ export default function StatCard({
       </div>
       <div className="mt-2 flex items-baseline gap-1">
         <span className="font-mono text-2xl font-semibold tabular-nums text-white">
-          {animated.toFixed(digits)}
+          {hasValue ? value.toFixed(digits) : "—"}
         </span>
-        {suffix && <span className="text-xs font-medium text-slate-400">{suffix}</span>}
+        {hasValue && suffix && (
+          <span className="text-xs font-medium text-slate-400">{suffix}</span>
+        )}
       </div>
-      {sublabel && <p className="mt-1 text-[11px] text-slate-500">{sublabel}</p>}
+      {sublabel && (
+        <p className="mt-1 text-[11px] text-slate-500">{sublabel}</p>
+      )}
     </div>
   );
 }

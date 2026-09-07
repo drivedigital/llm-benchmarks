@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Cpu } from "lucide-react";
 import type { ModelDef, RunResult } from "../types";
 import { formatMs, formatTokS } from "../utils/format";
+import { average } from "../utils/metrics";
 
 type SortKey =
   | "name"
@@ -15,9 +16,9 @@ type SortKey =
 interface Row {
   model: ModelDef;
   runs: number;
-  tokPerSec: number;
-  ttft: number;
-  duration: number;
+  tokPerSec?: number;
+  ttft?: number;
+  duration?: number;
   successRate: number;
 }
 
@@ -34,23 +35,28 @@ export default function LeaderboardTable({
   const [sortDir, setSortDir] = useState<1 | -1>(-1);
 
   const rows = useMemo<Row[]>(() => {
-    return models.map((model) => {
-      const modelRuns = runs.filter((r) => r.modelId === model.id && r.status !== "queued");
-      const finished = modelRuns.filter((r) => r.status === "success" || r.status === "error");
-      const successRuns = modelRuns.filter((r) => r.status === "success");
-      const avg = (fn: (r: RunResult) => number | undefined) => {
-        const vals = successRuns.map(fn).filter((v): v is number => v !== undefined);
-        return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
-      };
-      return {
-        model,
-        runs: finished.length,
-        tokPerSec: avg((r) => r.tokensPerSec),
-        ttft: avg((r) => r.ttftMs),
-        duration: avg((r) => r.durationMs),
-        successRate: finished.length ? (successRuns.length / finished.length) * 100 : 0,
-      };
-    });
+    return models
+      .map((model) => {
+        const modelRuns = runs.filter((r) => r.modelId === model.id);
+        const finished = modelRuns.filter(
+          (r) => r.status === "success" || r.status === "error",
+        );
+        const successRuns = modelRuns.filter((r) => r.status === "success");
+        const avg = (fn: (r: RunResult) => number | undefined) => {
+          return average(successRuns.map(fn));
+        };
+        return {
+          model,
+          runs: finished.length,
+          tokPerSec: avg((r) => r.tokensPerSec),
+          ttft: avg((r) => r.ttftMs),
+          duration: avg((r) => r.durationMs),
+          successRate: finished.length
+            ? (successRuns.length / finished.length) * 100
+            : 0,
+        };
+      })
+      .filter((row) => row.runs > 0);
   }, [models, runs]);
 
   const sorted = useMemo(() => {
@@ -64,13 +70,13 @@ export default function LeaderboardTable({
           bv = b.model.name;
           return sortDir * av.localeCompare(bv);
         case "engine":
-          av = a.model.engine;
-          bv = b.model.engine;
+          av = a.model.engine ?? "";
+          bv = b.model.engine ?? "";
           return sortDir * av.localeCompare(bv);
         default:
-          av = a[sortKey];
-          bv = b[sortKey];
-          return sortDir * ((av as number) - (bv as number));
+          if (a[sortKey] === undefined) return b[sortKey] === undefined ? 0 : 1;
+          if (b[sortKey] === undefined) return -1;
+          return sortDir * (a[sortKey]! - b[sortKey]!);
       }
     });
     return copy;
@@ -92,12 +98,16 @@ export default function LeaderboardTable({
     { key: "tokPerSec", label: "Avg tok/s", align: "right" },
     { key: "ttft", label: "Avg TTFT", align: "right" },
     { key: "duration", label: "Avg duration", align: "right" },
-    { key: "successRate", label: "Success", align: "right" },
+    { key: "successRate", label: "API success", align: "right" },
   ];
 
   function SortIcon({ col }: { col: SortKey }) {
     if (col !== sortKey) return <ArrowUpDown className="h-3 w-3 opacity-40" />;
-    return sortDir === 1 ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
+    return sortDir === 1 ? (
+      <ArrowUp className="h-3 w-3" />
+    ) : (
+      <ArrowDown className="h-3 w-3" />
+    );
   }
 
   return (
@@ -111,7 +121,9 @@ export default function LeaderboardTable({
                 onClick={() => toggleSort(col.key)}
                 className={`cursor-pointer select-none py-2.5 pr-3 font-medium transition hover:text-slate-200 ${col.align === "right" ? "text-right" : ""}`}
               >
-                <span className={`inline-flex items-center gap-1 ${col.align === "right" ? "flex-row-reverse" : ""}`}>
+                <span
+                  className={`inline-flex items-center gap-1 ${col.align === "right" ? "flex-row-reverse" : ""}`}
+                >
                   {col.label}
                   <SortIcon col={col.key} />
                 </span>
@@ -120,6 +132,17 @@ export default function LeaderboardTable({
           </tr>
         </thead>
         <tbody>
+          {sorted.length === 0 && (
+            <tr>
+              <td
+                colSpan={columns.length}
+                className="py-10 text-center text-sm text-slate-500"
+              >
+                No benchmark results yet. Models are ranked only after actual
+                tests finish.
+              </td>
+            </tr>
+          )}
           {sorted.map((row, idx) => (
             <tr
               key={row.model.id}
@@ -142,9 +165,13 @@ export default function LeaderboardTable({
                     {idx + 1}
                   </span>
                   <div className="min-w-0">
-                    <p className="truncate font-medium text-slate-100">{row.model.name}</p>
+                    <p className="truncate font-medium text-slate-100">
+                      {row.model.name}
+                    </p>
                     <p className="truncate text-[11px] text-slate-500">
-                      {row.model.family} Â· {row.model.paramSize} Â· {row.model.quant}
+                      {[row.model.family, row.model.paramSize, row.model.quant]
+                        .filter(Boolean)
+                        .join(" · ") || row.model.id}
                     </p>
                   </div>
                 </div>
@@ -158,10 +185,12 @@ export default function LeaderboardTable({
                   }`}
                 >
                   <Cpu className="h-3 w-3" />
-                  {row.model.engine}
+                  {row.model.engine ?? "Not reported"}
                 </span>
               </td>
-              <td className="py-2.5 pr-3 text-right font-mono text-slate-300">{row.runs}</td>
+              <td className="py-2.5 pr-3 text-right font-mono text-slate-300">
+                {row.runs}
+              </td>
               <td className="py-2.5 pr-3 text-right font-mono text-slate-200">
                 {formatTokS(row.tokPerSec)}
               </td>

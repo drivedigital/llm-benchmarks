@@ -1,12 +1,11 @@
-// Live execution against an OpenAI-compatible inference server (Jan, llama.cpp,
-// vLLM, LM Studio, the bundled mock, ...). Streams /v1/chat/completions and
-// derives real benchmark telemetry: TTFT, generation throughput, duration.
+// Real OpenAI-compatible API execution only. No simulated outcomes or token estimates.
+import { apiPath } from "./apiConfig";
 
 export type LiveErrorKind = "network" | "http" | "timeout" | "stream";
 
 export interface LiveOutcome {
   success: boolean;
-  /** true when the caller aborted deliberately (purge / unmount) — drop silently */
+  /** Deliberately aborted by the caller; it decides whether to clear or cancel the run. */
   cancelled?: boolean;
   errorKind?: LiveErrorKind;
   ttftMs?: number;
@@ -21,90 +20,123 @@ export interface LiveCompletionOptions {
   baseUrl: string;
   modelId: string;
   prompt: string;
+  imageUrls?: string[];
   maxTokens: number;
   signal: AbortSignal;
 }
 
-/** Longest silence allowed between streamed chunks before a run is declared stalled. */
 const STREAM_IDLE_TIMEOUT_MS = 60_000;
-
-export function normalizeBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "");
-}
-
-/**
- * Joins a base URL with a `/v1/...` path, tolerating users who paste the
- * base URL with or without the trailing `/v1`.
- */
-export function apiPath(baseUrl: string, path: string): string {
-  const base = normalizeBaseUrl(baseUrl);
-  const suffix = base.endsWith("/v1") ? path.replace(/^\/v1/, "") : path;
-  return `${base}${suffix}`;
-}
 
 function elapsedMs(t0: number): number {
   return Math.round(performance.now() - t0);
 }
 
-/** Rough token estimate for responses that report no usage (whitespace/char heuristic). */
-function estimateTokens(text: string): number {
-  return Math.max(1, Math.round(text.length / 4));
+function reportedTokens(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
 }
 
-/** Probe an OpenAI-compatible server for its served model list. Throws on failure. */
+function rejectMock(res: Response) {
+  if (res.headers.get("x-benchmark-mock") === "true") {
+    throw new Error(
+      "This is a mock API for automated tests, not an inference server. Connect to Jan to collect benchmark data.",
+    );
+  }
+}
+
+/** A 200 response alone is not proof of a working models endpoint. */
 export async function probeModels(
   baseUrl: string,
   timeoutMs = 4000,
-): Promise<string[] | undefined> {
+  signal?: AbortSignal,
+): Promise<string[]> {
   const controller = new AbortController();
+  const onAbort = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   const timer = setTimeout(() => controller.abort("probe-timeout"), timeoutMs);
   try {
-    const res = await fetch(apiPath(baseUrl, "/v1/models"), { signal: controller.signal });
+    const res = await fetch(apiPath(baseUrl, "/v1/models"), {
+      signal: controller.signal,
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = (await res.json().catch(() => null)) as
-      | { data?: { id?: string }[] }
-      | null;
-    return Array.isArray(data?.data)
-      ? data.data.map((m) => String(m?.id ?? "unknown"))
-      : undefined;
+    rejectMock(res);
+    const body = await res.json();
+    if (
+      !Array.isArray(body?.data) ||
+      body.data.some(
+        (m: unknown) =>
+          !m ||
+          typeof m !== "object" ||
+          !("id" in m) ||
+          typeof m.id !== "string" ||
+          !m.id.trim(),
+      )
+    ) {
+      throw new Error("Server did not return a valid /v1/models list.");
+    }
+    return [...new Set<string>(body.data.map((m: { id: string }) => m.id))];
+  } catch (err) {
+    if (controller.signal.reason === "probe-timeout") {
+      throw new Error("Connection check timed out.");
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
 /**
- * Execute one real benchmark run. Resolves with an outcome object and never
- * throws — every failure mode (network down, HTTP error, stall, abort) is
- * captured in the outcome so callers can record it as run telemetry.
+ * Execute one request, measuring the received stream and wall-clock duration.
+ * Tokens come only from the server's usage field. Missing usage, a single
+ * content chunk, or a non-streamed response leave unmeasurable metrics absent.
  */
 export async function streamChatCompletion(
   opts: LiveCompletionOptions,
 ): Promise<LiveOutcome> {
-  const { baseUrl, modelId, prompt, maxTokens, signal } = opts;
-
-  // Internal controller lets us abort independently on stream stalls, while
-  // still honoring the caller's signal (purge, per-run max duration, unmount).
+  const { baseUrl, modelId, prompt, imageUrls, maxTokens, signal } = opts;
   const internal = new AbortController();
   const onExternalAbort = () => internal.abort(signal.reason ?? "aborted");
   signal.addEventListener("abort", onExternalAbort, { once: true });
+  if (signal.aborted) onExternalAbort();
 
-  let idleTimer = 0;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const armIdleWatchdog = () => {
-    window.clearTimeout(idleTimer);
-    idleTimer = window.setTimeout(
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(
       () => internal.abort("idle-timeout"),
       STREAM_IDLE_TIMEOUT_MS,
     );
   };
 
   const t0 = performance.now();
-  let firstTokenAt: number | null = null;
-  let lastChunkAt: number | null = null;
+  let firstTokenAt: number | undefined;
+  let lastTokenAt: number | undefined;
   let completionTokens: number | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const parts: string[] = [];
+  const failedStream = (error: string): LiveOutcome => ({
+    success: false,
+    errorKind: "stream",
+    durationMs: elapsedMs(t0),
+    response: parts.join("") || undefined,
+    error,
+  });
 
   try {
+    if (internal.signal.aborted) throw new Error("Request aborted.");
     armIdleWatchdog();
+    const content = imageUrls?.length
+      ? [
+          { type: "text", text: prompt },
+          ...imageUrls.map((url) => ({
+            type: "image_url",
+            image_url: { url },
+          })),
+        ]
+      : prompt;
     const res = await fetch(apiPath(baseUrl, "/v1/chat/completions"), {
       method: "POST",
       headers: {
@@ -113,7 +145,7 @@ export async function streamChatCompletion(
       },
       body: JSON.stringify({
         model: modelId,
-        messages: [{ role: "user", content: prompt }],
+        messages: [{ role: "user", content }],
         stream: true,
         max_tokens: maxTokens,
         temperature: 0.6,
@@ -124,7 +156,7 @@ export async function streamChatCompletion(
     armIdleWatchdog();
 
     if (!res.ok) {
-      const detail = (await res.text().catch(() => "")).trim().slice(0, 240);
+      const detail = (await res.text()).trim().slice(0, 240);
       return {
         success: false,
         errorKind: "http",
@@ -132,128 +164,127 @@ export async function streamChatCompletion(
         error: `HTTP ${res.status}${detail ? ` — ${detail}` : ""}`,
       };
     }
+    rejectMock(res);
 
-    const contentType = res.headers.get("content-type") ?? "";
-
-    // Non-streaming JSON fallback (server ignored `stream: true`).
-    if (!res.body || !contentType.includes("text/event-stream")) {
-      const data = (await res.json().catch(() => null)) as
-        | {
-            choices?: { message?: { content?: string } }[];
-            usage?: { completion_tokens?: number };
-          }
-        | null;
-      const text = data?.choices?.[0]?.message?.content ?? "";
-      const totalMs = elapsedMs(t0);
-      const tokens = data?.usage?.completion_tokens ?? (text ? estimateTokens(text) : 0);
-      if (!text && tokens === 0) {
-        return {
-          success: false,
-          errorKind: "stream",
-          durationMs: totalMs,
-          error: "Server returned an empty completion.",
-        };
+    if (
+      !(res.headers.get("content-type") ?? "").includes("text/event-stream")
+    ) {
+      const data = await res.json().catch(() => null);
+      const text: unknown = data?.choices?.[0]?.message?.content;
+      if (typeof text !== "string" || !text) {
+        return failedStream("Server returned an invalid or empty completion.");
       }
       return {
         success: true,
-        ttftMs: totalMs, // indistinguishable without streaming
-        tokensPerSec: Math.round((tokens / Math.max(totalMs, 1)) * 1000 * 10) / 10,
-        tokensGenerated: tokens,
-        durationMs: totalMs,
+        // No TTFT or generation rate can be measured from one complete JSON response.
+        tokensGenerated: reportedTokens(data?.usage?.completion_tokens),
+        durationMs: elapsedMs(t0),
         response: text,
       };
     }
+    if (!res.body) return failedStream("Server returned no response stream.");
 
-    const reader = res.body.getReader();
+    reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let done = false;
+    let finished = false;
+    let streamError: string | undefined;
 
-    while (!done) {
-      const { value, done: streamDone } = await reader.read();
-      armIdleWatchdog();
-      if (streamDone) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (payload === "[DONE]") {
-          done = true;
-          break;
+    function consumeLine(raw: string, receivedAt: number) {
+      const line = raw.trim();
+      if (!line.startsWith("data:")) return; // SSE comments / keep-alives
+      const payload = line.slice(5).trim();
+      if (!payload) return;
+      if (payload === "[DONE]") {
+        done = true;
+        return;
+      }
+      try {
+        const chunk = JSON.parse(payload);
+        if (chunk?.error) {
+          streamError =
+            typeof chunk.error.message === "string"
+              ? chunk.error.message
+              : "Server reported a stream error.";
+          return;
         }
-        try {
-          const chunk = JSON.parse(payload);
-          const delta: unknown =
-            chunk?.choices?.[0]?.delta?.content ?? chunk?.choices?.[0]?.text;
-          lastChunkAt = performance.now();
-          if (typeof delta === "string" && delta.length > 0) {
-            if (firstTokenAt === null) firstTokenAt = lastChunkAt;
-            parts.push(delta);
-          }
-          if (chunk?.usage?.completion_tokens != null) {
-            completionTokens = Number(chunk.usage.completion_tokens);
-          }
-        } catch {
-          // keep-alive comment or partial JSON — ignored
+        const choice = chunk?.choices?.[0];
+        const delta: unknown = choice?.delta?.content ?? choice?.text;
+        if (typeof delta === "string" && delta.length > 0) {
+          // Events delivered in the same network read share an arrival time.
+          // Parsing a buffered response is not a measurement of model speed.
+          firstTokenAt ??= receivedAt;
+          lastTokenAt = receivedAt;
+          parts.push(delta);
         }
+        if (choice?.finish_reason != null) finished = true;
+        completionTokens =
+          reportedTokens(chunk?.usage?.completion_tokens) ?? completionTokens;
+      } catch {
+        streamError = "Server sent malformed JSON in the completion stream.";
       }
     }
 
-    const totalMs = elapsedMs(t0);
-    const text = parts.join("");
-    const tokens = completionTokens ?? (text ? estimateTokens(text) : 0);
-
-    if (!text && tokens === 0) {
-      return {
-        success: false,
-        errorKind: "stream",
-        durationMs: totalMs,
-        error: "Stream ended without any completion content.",
-      };
+    while (!done && !streamError) {
+      const { value, done: streamDone } = await reader.read();
+      const receivedAt = performance.now();
+      armIdleWatchdog();
+      buffer += decoder.decode(value, { stream: !streamDone });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        consumeLine(line, receivedAt);
+        if (done || streamError) break;
+      }
+      if (streamDone) {
+        if (!done && !streamError && buffer.trim())
+          consumeLine(buffer, receivedAt);
+        break;
+      }
     }
 
-    const ttftMs =
-      firstTokenAt !== null ? Math.max(1, Math.round(firstTokenAt - t0)) : totalMs;
-    const genMs =
-      firstTokenAt !== null && lastChunkAt !== null && lastChunkAt > firstTokenAt
-        ? lastChunkAt - firstTokenAt
-        : totalMs;
-    const tokensPerSec = Math.round((tokens / Math.max(genMs, 1)) * 1000 * 10) / 10;
+    if (streamError) return failedStream(streamError);
+    if (!done && !finished)
+      return failedStream("Stream closed before the completion finished.");
+    const text = parts.join("");
+    if (!text)
+      return failedStream("Stream ended without any completion content.");
 
+    const genMs =
+      firstTokenAt !== undefined && lastTokenAt !== undefined
+        ? lastTokenAt - firstTokenAt
+        : 0;
     return {
       success: true,
-      ttftMs,
-      tokensPerSec,
-      tokensGenerated: tokens,
-      durationMs: totalMs,
+      ttftMs:
+        firstTokenAt === undefined ? undefined : Math.round(firstTokenAt - t0),
+      tokensPerSec:
+        completionTokens !== undefined && genMs > 0
+          ? Math.round((completionTokens / genMs) * 1000 * 10) / 10
+          : undefined,
+      tokensGenerated: completionTokens,
+      durationMs: elapsedMs(t0),
       response: text,
     };
   } catch (err) {
     if (signal.aborted) {
-      if (signal.reason === "live-timeout") {
-        return {
-          success: false,
-          errorKind: "timeout",
-          durationMs: elapsedMs(t0),
-          error: "Run exceeded the per-run time limit and was aborted.",
-        };
-      }
-      // Purge / unmount — caller will drop the entry; do not record anything.
-      return { success: false, cancelled: true };
+      return signal.reason === "live-timeout"
+        ? {
+            success: false,
+            errorKind: "timeout",
+            durationMs: elapsedMs(t0),
+            error: "Run exceeded the per-run time limit and was aborted.",
+          }
+        : { success: false, cancelled: true };
     }
-    if (internal.signal.aborted && internal.signal.reason === "idle-timeout") {
+    if (internal.signal.reason === "idle-timeout") {
       return {
         success: false,
         errorKind: "timeout",
         durationMs: elapsedMs(t0),
-        error: `Stream stalled — no token received for ${Math.round(STREAM_IDLE_TIMEOUT_MS / 1000)}s.`,
+        error: "Stream stalled — no data received for 60 seconds.",
       };
-    }
-    if (internal.signal.aborted) {
-      return { success: false, cancelled: true };
     }
     return {
       success: false,
@@ -262,7 +293,11 @@ export async function streamChatCompletion(
       error: err instanceof Error ? err.message : "Unknown network error",
     };
   } finally {
-    window.clearTimeout(idleTimer);
+    clearTimeout(idleTimer);
     signal.removeEventListener("abort", onExternalAbort);
+    if (reader) {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
   }
 }

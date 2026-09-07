@@ -3,24 +3,23 @@
  * Mock OpenAI-compatible inference server for testing the dashboard without a
  * real Jan/llama.cpp instance. Zero dependencies — Node 18+ only.
  *
- *   GET  /v1/models            -> OpenAI model list (matches the dashboard roster ids)
+ *   GET  /v1/models            -> OpenAI model list (test fixture IDs)
  *   POST /v1/chat/completions  -> SSE-streamed chat completion with realistic
  *                                 TTFT, per-model tokens/sec pacing, and usage stats
  *
  * Env:
- *   PORT               listen port (default 1337, Jan's default)
+ *   PORT               listen port (default 1338; deliberately different from Jan)
  *   MOCK_FAILURE_RATE  probability a request fails with HTTP 500 (default 0.06)
  *   MOCK_MAX_TOKENS    cap on generated tokens per request (default 800)
  */
 import http from "node:http";
 import crypto from "node:crypto";
 
-const PORT = Number(process.env.PORT || 1337);
+const PORT = Number(process.env.PORT || 1338);
 const FAILURE_RATE = Number(process.env.MOCK_FAILURE_RATE ?? 0.06);
 const MAX_TOKENS_CAP = Number(process.env.MOCK_MAX_TOKENS ?? 800);
 
-// Same ids as the dashboard's DEFAULT_MODELS so the rotation runs real
-// requests for every roster entry. Speeds roughly mirror the simulator baselines.
+// Synthetic fixtures for API contract tests only. Never benchmark these as models.
 const MODELS = [
   { id: "jan-v3.5-4b-q4kxl", tokPerSec: 62, ttftMs: 210 },
   { id: "phi4-mm-q4km", tokPerSec: 47, ttftMs: 340 },
@@ -36,8 +35,9 @@ const MODELS = [
 ];
 
 const FILLER =
-  "benchmark telemetry confirms stable decode throughput across the sampled window with no thermal throttling or kv cache pressure observed during sustained generation of structured output tokens for the requested evaluation prompt . "
-    .split(" ");
+  "benchmark telemetry confirms stable decode throughput across the sampled window with no thermal throttling or kv cache pressure observed during sustained generation of structured output tokens for the requested evaluation prompt . ".split(
+    " ",
+  );
 
 function jitter(min, max) {
   return min + Math.random() * (max - min);
@@ -84,14 +84,22 @@ function readBody(req) {
 }
 
 function setCors(res) {
+  res.setHeader("X-Benchmark-Mock", "true");
+  res.setHeader("Access-Control-Expose-Headers", "X-Benchmark-Mock");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-mock-no-fail");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, x-mock-no-fail",
+  );
 }
 
 const server = http.createServer(async (req, res) => {
   setCors(res);
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const url = new URL(
+    req.url || "/",
+    `http://${req.headers.host || "localhost"}`,
+  );
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -141,7 +149,10 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          error: { message: `mock: simulated decode stall for ${model}`, type: "server_error" },
+          error: {
+            message: `mock: simulated decode stall for ${model}`,
+            type: "server_error",
+          },
         }),
       );
       return;
@@ -206,7 +217,9 @@ const server = http.createServer(async (req, res) => {
 
     for (let i = 0; i < maxTokens; i += 1) {
       if (closed) return;
-      res.write(sseChunk(completionId, model, { content: ` ${makeToken(i, prompt)}` }));
+      res.write(
+        sseChunk(completionId, model, { content: ` ${makeToken(i, prompt)}` }),
+      );
       await sleep(perTokenMs * jitter(0.6, 1.5));
     }
     if (closed) return;
@@ -234,7 +247,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: { message: `Not found: ${req.method} ${url.pathname}` } }));
+  res.end(
+    JSON.stringify({
+      error: { message: `Not found: ${req.method} ${url.pathname}` },
+    }),
+  );
 });
 
 server.listen(PORT, "0.0.0.0", () => {

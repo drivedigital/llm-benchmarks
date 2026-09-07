@@ -1,6 +1,7 @@
-import { Radio, Loader2, AlertTriangle, WifiOff } from "lucide-react";
+import { AlertTriangle, Loader2, Settings2, Wifi, WifiOff } from "lucide-react";
 import type { ConnectionState } from "../types";
 
+/** The single header entry point for server settings and the model roster. */
 export default function ConnectionPill({
   connection,
   onClick,
@@ -8,53 +9,40 @@ export default function ConnectionPill({
   connection: ConnectionState;
   onClick: () => void;
 }) {
-  const styles: Record<ConnectionState["status"], string> = {
-    connected: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/30",
-    connecting: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
-    error: "bg-rose-500/10 text-rose-400 ring-rose-500/30",
-    disconnected: "bg-slate-500/10 text-slate-400 ring-slate-500/30",
-  };
-
-  const icon = {
-    connected: <Radio className="h-3.5 w-3.5" />,
-    connecting: <Loader2 className="h-3.5 w-3.5 animate-spin" />,
-    error: <AlertTriangle className="h-3.5 w-3.5" />,
-    disconnected: <WifiOff className="h-3.5 w-3.5" />,
+  const styles = {
+    connected: "text-emerald-400",
+    connecting: "text-amber-400",
+    error: "text-rose-400",
+    disconnected: "text-slate-400",
   }[connection.status];
-
+  const Icon = {
+    connected: Wifi,
+    connecting: Loader2,
+    error: AlertTriangle,
+    disconnected: WifiOff,
+  }[connection.status];
   const label = {
-    connected: "Live",
-    connecting: "Connecting",
-    error: "Simulated",
-    disconnected: "Offline",
+    connected: "Connected",
+    connecting: "Checking",
+    error: "Connection error",
+    disconnected: "Not connected",
   }[connection.status];
 
   return (
     <button
       onClick={onClick}
-      title={connection.message}
-      className={`group flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ring-1 transition hover:ring-2 ${styles[connection.status]}`}
+      title={`${connection.baseUrl} — ${connection.message ?? label}`}
+      className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:bg-white/10"
     >
-      <span className="relative flex h-2 w-2">
-        {connection.status === "connected" && (
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-        )}
-        <span
-          className={`relative inline-flex h-2 w-2 rounded-full ${
-            connection.status === "connected"
-              ? "bg-emerald-400"
-              : connection.status === "connecting"
-                ? "bg-amber-400"
-                : connection.status === "error"
-                  ? "bg-rose-400"
-                  : "bg-slate-400"
-          }`}
+      <Settings2 className="h-3.5 w-3.5" />
+      <span>Server &amp; models</span>
+      <span
+        className={`flex items-center gap-1.5 border-l border-white/10 pl-2 ${styles}`}
+      >
+        <Icon
+          className={`h-3.5 w-3.5 ${connection.status === "connecting" ? "animate-spin" : ""}`}
         />
-      </span>
-      {icon}
-      <span>{label}</span>
-      <span className="hidden font-mono text-[10px] text-current/70 sm:inline">
-        {connection.baseUrl}
+        {label}
       </span>
     </button>
   );

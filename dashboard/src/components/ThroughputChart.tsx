@@ -25,14 +25,18 @@ export default function ThroughputChart({
   const data = models
     .map((m) => {
       const successRuns = runs.filter(
-        (r) => r.modelId === m.id && r.status === "success" && r.tokensPerSec,
+        (r) =>
+          r.modelId === m.id &&
+          r.status === "success" &&
+          r.tokensPerSec !== undefined,
       );
       const avg =
         successRuns.length > 0
-          ? successRuns.reduce((s, r) => s + (r.tokensPerSec ?? 0), 0) / successRuns.length
+          ? successRuns.reduce((s, r) => s + (r.tokensPerSec ?? 0), 0) /
+            successRuns.length
           : 0;
       return {
-        name: m.name.length > 22 ? `${m.name.slice(0, 21)}â¦` : m.name,
+        name: m.name.length > 22 ? `${m.name.slice(0, 21)}…` : m.name,
         fullName: m.name,
         engine: m.engine,
         value: Math.round(avg * 10) / 10,
@@ -45,7 +49,7 @@ export default function ThroughputChart({
   if (data.length === 0) {
     return (
       <div className="flex h-72 items-center justify-center text-sm text-slate-500">
-        Waiting for the first completed runsâ¦
+        No throughput measurements yet.
       </div>
     );
   }
@@ -58,7 +62,11 @@ export default function ThroughputChart({
         margin={{ top: 4, right: 24, left: 4, bottom: 4 }}
         barCategoryGap={10}
       >
-        <CartesianGrid strokeDasharray="3 3" stroke="#ffffff12" horizontal={false} />
+        <CartesianGrid
+          strokeDasharray="3 3"
+          stroke="#ffffff12"
+          horizontal={false}
+        />
         <XAxis
           type="number"
           tick={{ fill: "#94a3b8", fontSize: 11 }}
@@ -90,7 +98,10 @@ export default function ThroughputChart({
         />
         <Bar dataKey="value" radius={[0, 6, 6, 0]} maxBarSize={18}>
           {data.map((d) => (
-            <Cell key={d.fullName} fill={ENGINE_COLOR[d.engine] ?? "#38bdf8"} />
+            <Cell
+              key={d.fullName}
+              fill={ENGINE_COLOR[d.engine ?? ""] ?? "#38bdf8"}
+            />
           ))}
         </Bar>
       </BarChart>

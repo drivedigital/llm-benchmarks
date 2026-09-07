@@ -1,386 +1,448 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_MODELS } from "../data/models";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { DEFAULT_TESTS } from "../data/tests";
-import { nextId, simulateOutcome } from "../lib/simulator";
-import { normalizeBaseUrl, probeModels, streamChatCompletion } from "../lib/liveRunner";
+import { DEFAULT_BASE_URL, normalizeBaseUrl } from "../lib/apiConfig";
+import { probeModels, streamChatCompletion } from "../lib/liveRunner";
+import { isRunnableTest } from "../lib/testReadiness";
 import type { ConnectionState, ModelDef, RunResult, TestDef } from "../types";
 
 const MAX_CONCURRENT = 2;
 const MAX_RUNS_KEPT = 400;
-const TIME_SCALE = 0.16; // compress simulated wall-clock durations for a lively feed
-const LIVE_RUN_TIMEOUT_MS = 180_000; // hard cap for one real completion
-/** Relative path proxied by the Vite dev server to the real API server (see vite.config.ts). */
-const DEFAULT_BASE_URL = "/api";
+const LIVE_RUN_TIMEOUT_MS = 180_000;
 
-function shuffle<T>(arr: T[]): T[] {
-  const copy = [...arr];
-  for (let i = copy.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy;
-}
+type Combo = { modelId: string; testId: string };
+type ActiveRequest = {
+  controller: AbortController;
+  timer: number;
+  passId?: number;
+};
 
-function buildMatrix(models: ModelDef[], tests: TestDef[]) {
-  const enabledModels = models.filter((m) => m.enabled !== false);
-  const enabledTests = tests.filter((t) => t.enabled !== false);
-  const combos: { modelId: string; testId: string }[] = [];
-  enabledModels.forEach((m) => {
-    enabledTests.forEach((t) => {
-      combos.push({ modelId: m.id, testId: t.id });
-    });
-  });
-  return shuffle(combos);
-}
-
-function seedInitialRuns(models: ModelDef[], tests: TestDef[]): RunResult[] {
-  const combos = buildMatrix(models, tests).slice(0, 26);
-  const now = Date.now();
-  const runs: RunResult[] = combos.map((combo, idx) => {
-    const model = models.find((m) => m.id === combo.modelId)!;
-    const test = tests.find((t) => t.id === combo.testId)!;
-    const outcome = simulateOutcome(model, test);
-    const queuedAt = now - (combos.length - idx) * 9000 - 4000;
-    const startedAt = queuedAt + 200;
-    const finishedAt = startedAt + Math.max(300, outcome.durationMs * 0.2);
-    return {
-      id: nextId("seed"),
-      modelId: combo.modelId,
-      testId: combo.testId,
-      status: outcome.success ? "success" : "error",
-      queuedAt,
-      startedAt,
-      finishedAt,
-      ttftMs: outcome.ttftMs,
-      tokensPerSec: outcome.tokensPerSec,
-      tokensGenerated: outcome.tokensGenerated,
-      durationMs: outcome.durationMs,
-      response: outcome.response,
-      error: outcome.error,
-      simulated: true, // sample data — purge wipes these along with everything else
-    };
-  });
-  return runs.sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0));
+function buildMatrix(models: ModelDef[], tests: TestDef[]): Combo[] {
+  return models
+    .filter((m) => m.enabled !== false)
+    .flatMap((model) =>
+      tests
+        .filter(isRunnableTest)
+        .map((test) => ({ modelId: model.id, testId: test.id })),
+    );
 }
 
 export function useBenchSession() {
-  const [models, setModels] = useState<ModelDef[]>(
-    () => DEFAULT_MODELS.map((m) => ({ ...m, enabled: true })),
-  );
-  const [tests, setTests] = useState<TestDef[]>(
-    () => DEFAULT_TESTS.map((t) => ({ ...t, enabled: true })),
+  // A fresh page has no roster, results, active requests, or automatic rotation.
+  const [models, setModels] = useState<ModelDef[]>([]);
+  const [tests, setTests] = useState<TestDef[]>(() =>
+    DEFAULT_TESTS.map((t) => ({ ...t })),
   );
   const [connection, setConnection] = useState<ConnectionState>({
     baseUrl: DEFAULT_BASE_URL,
-    status: "connecting",
-    lastChecked: Date.now(),
-    message: "Probing the benchmark API via the dev-server proxy…",
+    status: "disconnected",
+    message:
+      "Not connected. Test the connection to load your server's models. No tests have started.",
   });
-  const [runs, setRuns] = useState<RunResult[]>(() =>
-    seedInitialRuns(
-      DEFAULT_MODELS.map((m) => ({ ...m, enabled: true })),
-      DEFAULT_TESTS.map((t) => ({ ...t, enabled: true })),
-    ),
-  );
-  const [paused, setPaused] = useState(false);
-  const [pass, setPass] = useState(1);
+  const [runs, setRuns] = useState<RunResult[]>([]);
+  const [paused, setPaused] = useState(true);
+  const [pass, setPass] = useState(0);
   const [passTotal, setPassTotal] = useState(0);
   const [passCompleted, setPassCompleted] = useState(0);
-  const [sessionStart] = useState(() => Date.now());
 
   const modelsRef = useRef(models);
   const testsRef = useRef(tests);
   const connectionRef = useRef(connection);
-  const queueRef = useRef<{ modelId: string; testId: string }[]>([]);
-  const runningCountRef = useRef(0);
-  const pausedRef = useRef(paused);
-  const timeoutsRef = useRef<number[]>([]);
-  const abortsRef = useRef<Map<string, AbortController>>(new Map());
-  const liveTimersRef = useRef<Map<string, number>>(new Map());
+  const pausedRef = useRef(true);
+  const queueRef = useRef<Combo[]>([]);
+  const activeRef = useRef(new Map<string, ActiveRequest>());
+  // Epochs keep purged/cancelled requests and stale probes from publishing later.
+  const epochRef = useRef(0);
+  const passIdRef = useRef(0);
+  const probeIdRef = useRef(0);
+  const probeControllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    modelsRef.current = models;
-  }, [models]);
-  useEffect(() => {
-    testsRef.current = tests;
-  }, [tests]);
-  useEffect(() => {
-    connectionRef.current = connection;
-  }, [connection]);
-  useEffect(() => {
-    pausedRef.current = paused;
-  }, [paused]);
-
-  // Prime the queue on mount and whenever the roster changes materially.
-  useEffect(() => {
-    const matrix = buildMatrix(models, tests);
-    queueRef.current = matrix;
-    setPassTotal(matrix.length);
-    setPassCompleted(0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [models.length, tests.length]);
-
-  const startRun = useCallback((combo: { modelId: string; testId: string }, adHoc = false) => {
-    const model = modelsRef.current.find((m) => m.id === combo.modelId);
-    const test = testsRef.current.find((t) => t.id === combo.testId);
-    if (!model || !test) return;
-
-    const live = connectionRef.current.status === "connected";
-    const runId = nextId("run");
-    const startedAt = Date.now();
-    const runningEntry: RunResult = {
-      id: runId,
-      modelId: combo.modelId,
-      testId: combo.testId,
-      status: "running",
-      queuedAt: startedAt,
-      startedAt,
-      simulated: !live,
-    };
-    setRuns((prev) => [runningEntry, ...prev].slice(0, MAX_RUNS_KEPT));
-    runningCountRef.current += 1;
-
-    if (!live) {
-      // Offline fallback: simulated telemetry keeps the dashboard explorable.
-      const outcome = simulateOutcome(model, test);
-      const waitMs = Math.min(6500, Math.max(900, outcome.durationMs * TIME_SCALE));
-      const timeoutId = window.setTimeout(() => {
-        setRuns((prev) =>
-          prev.map((r) =>
-            r.id === runId
-              ? {
-                  ...r,
-                  status: outcome.success ? "success" : "error",
-                  finishedAt: Date.now(),
-                  ttftMs: outcome.ttftMs,
-                  tokensPerSec: outcome.tokensPerSec,
-                  tokensGenerated: outcome.tokensGenerated,
-                  durationMs: outcome.durationMs,
-                  response: outcome.response,
-                  error: outcome.error,
-                }
-              : r,
-          ),
-        );
-        runningCountRef.current = Math.max(0, runningCountRef.current - 1);
-        if (!adHoc) setPassCompleted((c) => c + 1);
-      }, waitMs);
-      timeoutsRef.current.push(timeoutId);
-      return;
-    }
-
-    // Live path: stream a real completion from the connected server and record
-    // measured TTFT / throughput / duration.
-    const controller = new AbortController();
-    abortsRef.current.set(runId, controller);
-    const timeoutId = window.setTimeout(
-      () => controller.abort("live-timeout"),
-      LIVE_RUN_TIMEOUT_MS,
-    );
-    liveTimersRef.current.set(runId, timeoutId);
-
-    void streamChatCompletion({
-      baseUrl: connectionRef.current.baseUrl,
-      modelId: model.id,
-      prompt: test.prompt,
-      maxTokens: Math.max(64, Math.min(test.avgOutputTokens, 4000)),
-      signal: controller.signal,
-    })
-      .then((outcome) => {
-        if (outcome.cancelled) return; // purged or unmounted — entry already gone
-        if (outcome.errorKind === "network") {
-          // Server vanished mid-run — flip back to simulated fallback so the UI
-          // honestly reflects that subsequent numbers are not real.
-          setConnection((c) => ({
-            ...c,
-            status: "error",
-            lastChecked: Date.now(),
-            message: `Lost connection mid-run (${outcome.error}). Fell back to simulated telemetry.`,
-          }));
-        }
-        setRuns((prev) =>
-          prev.map((r) =>
-            r.id === runId
-              ? {
-                  ...r,
-                  status: outcome.success ? "success" : "error",
-                  finishedAt: Date.now(),
-                  ttftMs: outcome.ttftMs,
-                  tokensPerSec: outcome.tokensPerSec,
-                  tokensGenerated: outcome.tokensGenerated,
-                  durationMs: outcome.durationMs,
-                  response: outcome.response,
-                  error: outcome.error,
-                }
-              : r,
-          ),
-        );
-        if (!adHoc) setPassCompleted((c) => c + 1);
-      })
-      .catch(() => undefined) // streamChatCompletion resolves on all paths; belt & braces
-      .finally(() => {
-        runningCountRef.current = Math.max(0, runningCountRef.current - 1);
-        window.clearTimeout(timeoutId);
-        liveTimersRef.current.delete(runId);
-        abortsRef.current.delete(runId);
-      });
+  const replaceModels = useCallback((next: ModelDef[]) => {
+    modelsRef.current = next;
+    setModels(next);
+  }, []);
+  const replaceTests = useCallback((next: TestDef[]) => {
+    testsRef.current = next;
+    setTests(next);
+  }, []);
+  const replaceConnection = useCallback((next: ConnectionState) => {
+    connectionRef.current = next;
+    setConnection(next);
+  }, []);
+  const pauseRotation = useCallback(() => {
+    pausedRef.current = true;
+    setPaused(true);
   }, []);
 
-  // Main scheduler tick.
+  const clearActive = useCallback((reason: string) => {
+    epochRef.current += 1;
+    const ids = new Set(activeRef.current.keys());
+    activeRef.current.forEach(({ controller, timer }) => {
+      window.clearTimeout(timer);
+      controller.abort(reason);
+    });
+    activeRef.current.clear();
+    return ids;
+  }, []);
+
+  const resetRotation = useCallback(() => {
+    queueRef.current = [];
+    passIdRef.current += 1;
+    setPass(0);
+    setPassTotal(0);
+    setPassCompleted(0);
+  }, []);
+
+  const startRun = useCallback(
+    (combo: Combo, rotationPassId?: number): boolean => {
+      // All entry points, including ad-hoc runs, share these guards.
+      if (
+        connectionRef.current.status !== "connected" ||
+        activeRef.current.size >= MAX_CONCURRENT
+      )
+        return false;
+      const model = modelsRef.current.find(
+        (m) => m.id === combo.modelId && m.enabled !== false,
+      );
+      const test = testsRef.current.find(
+        (t) => t.id === combo.testId && isRunnableTest(t),
+      );
+      if (!model || !test) return false;
+
+      const runId = crypto.randomUUID();
+      const startedAt = Date.now();
+      const epoch = epochRef.current;
+      const baseUrl = connectionRef.current.baseUrl;
+      const controller = new AbortController();
+      const timer = window.setTimeout(
+        () => controller.abort("live-timeout"),
+        LIVE_RUN_TIMEOUT_MS,
+      );
+      const request: ActiveRequest = {
+        controller,
+        timer,
+        passId: rotationPassId,
+      };
+      activeRef.current.set(runId, request);
+      const runningEntry: RunResult = {
+        id: runId,
+        modelId: model.id,
+        testId: test.id,
+        model: { ...model },
+        test: { ...test, inputs: test.inputs ? [...test.inputs] : undefined },
+        baseUrl,
+        status: "running",
+        queuedAt: startedAt,
+        startedAt,
+      };
+      setRuns((previous) =>
+        [runningEntry, ...previous].slice(0, MAX_RUNS_KEPT),
+      );
+
+      void streamChatCompletion({
+        baseUrl,
+        modelId: model.id,
+        prompt: test.prompt,
+        imageUrls: test.category === "vision" ? test.inputs : undefined,
+        maxTokens: test.maxTokens,
+        signal: controller.signal,
+      })
+        .then((outcome) => {
+          if (epoch !== epochRef.current || outcome.cancelled) return;
+          if (!outcome.success) {
+            // Stop on a failed real request. Never silently substitute fabricated data,
+            // and never continue to hammer a down or misconfigured server.
+            pauseRotation();
+            replaceConnection({
+              ...connectionRef.current,
+              status: "error",
+              lastChecked: Date.now(),
+              message: `Request failed (${outcome.error}). Rotation stopped. Check the server and test settings, then test the connection again.`,
+            });
+          }
+          setRuns((previous) =>
+            previous.map((run) =>
+              run.id === runId
+                ? {
+                    ...run,
+                    status: outcome.success ? "success" : "error",
+                    finishedAt: Date.now(),
+                    ttftMs: outcome.ttftMs,
+                    tokensPerSec: outcome.tokensPerSec,
+                    tokensGenerated: outcome.tokensGenerated,
+                    durationMs: outcome.durationMs,
+                    response: outcome.response,
+                    error: outcome.error,
+                  }
+                : run,
+            ),
+          );
+          if (
+            rotationPassId !== undefined &&
+            rotationPassId === passIdRef.current
+          ) {
+            setPassCompleted((count) => count + 1);
+          }
+        })
+        .finally(() => {
+          window.clearTimeout(timer);
+          // An old request must not decrement the capacity of a new session after purge.
+          if (activeRef.current.get(runId) === request)
+            activeRef.current.delete(runId);
+        });
+      return true;
+    },
+    [pauseRotation, replaceConnection],
+  );
+
+  // The timer is just a dispatcher. It produces no results and does no work
+  // until the user explicitly starts rotation with a verified connection.
   useEffect(() => {
     const interval = window.setInterval(() => {
-      if (pausedRef.current) return;
+      if (pausedRef.current || connectionRef.current.status !== "connected")
+        return;
+      if (activeRef.current.size >= MAX_CONCURRENT) return;
       if (queueRef.current.length === 0) {
+        // Finish the current pass before incrementing or resetting progress.
+        if (
+          [...activeRef.current.values()].some(
+            (r) => r.passId === passIdRef.current,
+          )
+        )
+          return;
         const matrix = buildMatrix(modelsRef.current, testsRef.current);
+        if (matrix.length === 0) {
+          pauseRotation();
+          return;
+        }
         queueRef.current = matrix;
-        setPass((p) => p + 1);
+        passIdRef.current += 1;
+        setPass((previous) => previous + 1);
         setPassTotal(matrix.length);
         setPassCompleted(0);
       }
       while (
-        runningCountRef.current < MAX_CONCURRENT &&
+        activeRef.current.size < MAX_CONCURRENT &&
         queueRef.current.length > 0
       ) {
         const combo = queueRef.current.shift()!;
-        startRun(combo);
+        if (!startRun(combo, passIdRef.current)) {
+          // Disabled/removed models and incomplete tests are skipped, not recorded.
+          setPassTotal((total) => Math.max(0, total - 1));
+        }
       }
-    }, 1100);
+    }, 500);
     return () => window.clearInterval(interval);
-  }, [startRun]);
+  }, [pauseRotation, startRun]);
 
-  useEffect(() => {
-    return () => {
-      timeoutsRef.current.forEach((id) => window.clearTimeout(id));
-      abortsRef.current.forEach((c) => c.abort("unmount"));
-      liveTimersRef.current.forEach((id) => window.clearTimeout(id));
-    };
-  }, []);
+  useEffect(
+    () => () => {
+      clearActive("unmount");
+      probeIdRef.current += 1;
+      probeControllerRef.current?.abort("unmount");
+    },
+    [clearActive],
+  );
 
-  /**
-   * Wipe every recorded run result (seeded sample data + live data), abort
-   * in-flight runs, and reset the stat cards / charts / leaderboard / feed.
-   * The model roster, test suite, server settings, and rotation queue are
-   * intentionally untouched; the scheduler keeps collecting fresh data.
-   */
+  const togglePaused = useCallback(() => {
+    if (!pausedRef.current) {
+      pauseRotation(); // Already dispatched requests are allowed to finish.
+    } else if (
+      connectionRef.current.status === "connected" &&
+      buildMatrix(modelsRef.current, testsRef.current).length > 0
+    ) {
+      pausedRef.current = false;
+      setPaused(false);
+    }
+  }, [pauseRotation]);
+
+  /** Clear actual results and cancel in-flight requests, preserving the user's rotation choice. */
   const purgeRuns = useCallback(() => {
-    timeoutsRef.current.forEach((id) => window.clearTimeout(id));
-    timeoutsRef.current = [];
-    abortsRef.current.forEach((c) => c.abort("purge"));
-    liveTimersRef.current.forEach((id) => window.clearTimeout(id));
-    liveTimersRef.current.clear();
-    runningCountRef.current = 0;
+    clearActive("purge");
+    resetRotation();
     setRuns([]);
-    setPass(1);
-    setPassCompleted(0);
-  }, []);
+  }, [clearActive, resetRotation]);
 
   const runAdHoc = useCallback(
-    (modelId: string, testId: string) => {
-      startRun({ modelId, testId }, true);
-    },
+    (modelId: string, testId: string) => startRun({ modelId, testId }),
     [startRun],
   );
 
-  const addModel = useCallback((partial: Partial<ModelDef> & { name: string }) => {
-    // Use the entered name as the id so live runs POST a `model` value the
-    // server actually serves; fall back to a unique id only on collision.
-    const desired = partial.id ?? partial.name.trim();
-    const id = modelsRef.current.some((m) => m.id === desired)
-      ? `custom-${nextId("model")}`
-      : desired;
-    const newModel: ModelDef = {
-      id,
-      name: partial.name,
-      engine: partial.engine ?? "llama.cpp",
-      family: partial.family ?? partial.name.split(/[-\s]/)[0] ?? "Custom",
-      paramSize: partial.paramSize ?? "?",
-      quant: partial.quant ?? "custom",
-      baseTokPerSec: partial.baseTokPerSec ?? 30 + Math.random() * 30,
-      baseTtftMs: partial.baseTtftMs ?? 250 + Math.random() * 200,
-      reliability: partial.reliability ?? 0.9,
-      visionCapable: partial.visionCapable ?? true,
-      custom: true,
-      enabled: true,
-    };
-    setModels((prev) => [...prev, newModel]);
-    return newModel;
-  }, []);
+  const addModel = useCallback(
+    (partial: Partial<ModelDef> & { name: string }) => {
+      const id = (partial.id ?? partial.name).trim();
+      if (!id) return;
+      const existing = modelsRef.current.find((m) => m.id === id);
+      if (existing) return existing; // Never invent an identifier the server cannot serve.
+      const model: ModelDef = {
+        ...partial,
+        id,
+        name: partial.name.trim(),
+        custom: true,
+        enabled: true,
+      };
+      replaceModels([...modelsRef.current, model]);
+      return model;
+    },
+    [replaceModels],
+  );
 
-  const removeModel = useCallback((modelId: string) => {
-    setModels((prev) => prev.filter((m) => m.id !== modelId));
-    queueRef.current = queueRef.current.filter((c) => c.modelId !== modelId);
-  }, []);
+  const removeModel = useCallback(
+    (modelId: string) => {
+      replaceModels(modelsRef.current.filter((m) => m.id !== modelId));
+    },
+    [replaceModels],
+  );
 
-  const toggleModelEnabled = useCallback((modelId: string) => {
-    setModels((prev) =>
-      prev.map((m) => (m.id === modelId ? { ...m, enabled: m.enabled === false } : m)),
-    );
-  }, []);
+  const toggleModelEnabled = useCallback(
+    (modelId: string) => {
+      replaceModels(
+        modelsRef.current.map((m) =>
+          m.id === modelId ? { ...m, enabled: m.enabled === false } : m,
+        ),
+      );
+    },
+    [replaceModels],
+  );
 
-  const updateTest = useCallback((testId: string, patch: Partial<TestDef>) => {
-    setTests((prev) => prev.map((t) => (t.id === testId ? { ...t, ...patch } : t)));
-  }, []);
+  const updateTest = useCallback(
+    (testId: string, patch: Partial<TestDef>) => {
+      replaceTests(
+        testsRef.current.map((t) =>
+          t.id === testId ? { ...t, ...patch, id: t.id } : t,
+        ),
+      );
+    },
+    [replaceTests],
+  );
 
-  const addTest = useCallback((test: Omit<TestDef, "id"> & { id?: string }) => {
-    const id = test.id ?? `custom-${nextId("test")}`;
-    setTests((prev) => [...prev, { ...test, id, custom: true, enabled: true }]);
-  }, []);
+  const addTest = useCallback(
+    (test: Omit<TestDef, "id"> & { id?: string }) => {
+      const id = test.id ?? crypto.randomUUID();
+      if (testsRef.current.some((t) => t.id === id)) return;
+      replaceTests([...testsRef.current, { ...test, id, custom: true }]);
+    },
+    [replaceTests],
+  );
 
-  const removeTest = useCallback((testId: string) => {
-    setTests((prev) => prev.filter((t) => t.id !== testId));
-    queueRef.current = queueRef.current.filter((c) => c.testId !== testId);
-  }, []);
+  const removeTest = useCallback(
+    (testId: string) => {
+      replaceTests(testsRef.current.filter((t) => t.id !== testId));
+    },
+    [replaceTests],
+  );
 
-  const toggleTestEnabled = useCallback((testId: string) => {
-    setTests((prev) =>
-      prev.map((t) => (t.id === testId ? { ...t, enabled: t.enabled === false } : t)),
-    );
-  }, []);
+  const toggleTestEnabled = useCallback(
+    (testId: string) => {
+      replaceTests(
+        testsRef.current.map((t) =>
+          t.id === testId ? { ...t, enabled: t.enabled === false } : t,
+        ),
+      );
+    },
+    [replaceTests],
+  );
 
   const resetTestsToDefault = useCallback(() => {
-    setTests(DEFAULT_TESTS.map((t) => ({ ...t, enabled: true })));
-  }, []);
+    replaceTests(DEFAULT_TESTS.map((t) => ({ ...t })));
+  }, [replaceTests]);
 
-  const updateBaseUrl = useCallback((url: string) => {
-    setConnection((c) => ({ ...c, baseUrl: url }));
-  }, []);
-
-  const testConnection = useCallback(async (urlOverride?: string) => {
-    const url = normalizeBaseUrl(urlOverride ?? connectionRef.current.baseUrl);
-    setConnection((c) => ({ ...c, status: "connecting", message: "Probing server…" }));
-    try {
-      const served = await probeModels(url);
-      const count = served?.length;
-      setConnection({
-        baseUrl: url,
-        status: "connected",
-        lastChecked: Date.now(),
+  const updateBaseUrl = useCallback(
+    (url: string) => {
+      const baseUrl = normalizeBaseUrl(url);
+      if (baseUrl === connectionRef.current.baseUrl) return;
+      probeIdRef.current += 1;
+      probeControllerRef.current?.abort("server-changed");
+      const cancelled = clearActive("server-changed");
+      setRuns((previous) =>
+        previous.map((run) =>
+          cancelled.has(run.id)
+            ? {
+                ...run,
+                status: "cancelled",
+                finishedAt: Date.now(),
+                durationMs: Date.now() - run.startedAt,
+                error: "Request cancelled because the API server changed.",
+              }
+            : run,
+        ),
+      );
+      resetRotation();
+      pauseRotation();
+      replaceModels([]);
+      replaceConnection({
+        baseUrl,
+        status: "disconnected",
         message:
-          count !== undefined
-            ? `Live connection — ${count} model(s) served. Rotation now records real completions.`
-            : "Live connection established. Rotation now records real completions.",
+          "Server changed. Test the connection before starting benchmarks.",
       });
-      return true;
-    } catch (err) {
-      setConnection({
-        baseUrl: url,
-        status: "error",
-        lastChecked: Date.now(),
+    },
+    [
+      clearActive,
+      pauseRotation,
+      replaceConnection,
+      replaceModels,
+      resetRotation,
+    ],
+  );
+
+  const testConnection = useCallback(
+    async (urlOverride?: string): Promise<boolean> => {
+      const baseUrl = normalizeBaseUrl(
+        urlOverride ?? connectionRef.current.baseUrl,
+      );
+      updateBaseUrl(baseUrl);
+      pauseRotation();
+      const probeId = ++probeIdRef.current;
+      probeControllerRef.current?.abort("new-probe");
+      const controller = new AbortController();
+      probeControllerRef.current = controller;
+      replaceConnection({
+        ...connectionRef.current,
+        status: "connecting",
         message:
-          err instanceof Error
-            ? `Unreachable from browser (${err.message}). Running in simulated mode.`
-            : "Unreachable from browser. Running in simulated mode.",
+          "Checking /v1/models. No new benchmarks will start during the check.",
       });
-      return false;
-    }
-  }, []);
+      try {
+        const served = await probeModels(baseUrl, 4000, controller.signal);
+        if (probeId !== probeIdRef.current) return false;
+        replaceModels(
+          served.map(
+            (id) =>
+              modelsRef.current.find((m) => m.id === id) ?? {
+                id,
+                name: id,
+                enabled: true,
+              },
+          ),
+        );
+        replaceConnection({
+          baseUrl,
+          status: "connected",
+          lastChecked: Date.now(),
+          message: served.length
+            ? `Connected — ${served.length} model(s) reported by the API. Choose Start benchmarks or Run now to send real requests.`
+            : "Connected, but the API reports no models. Load a model in Jan, then test the connection again.",
+        });
+        return true;
+      } catch (err) {
+        if (probeId !== probeIdRef.current) return false;
+        replaceConnection({
+          baseUrl,
+          status: "error",
+          lastChecked: Date.now(),
+          message: `Connection failed (${err instanceof Error ? err.message : "Unknown error"}). No new tests will run. Check that Jan's API server is enabled and reachable from the machine running this dashboard.`,
+        });
+        return false;
+      } finally {
+        if (probeId === probeIdRef.current) probeControllerRef.current = null;
+      }
+    },
+    [pauseRotation, replaceConnection, replaceModels, updateBaseUrl],
+  );
 
-  // Probe the default endpoint once on mount so the pill reflects reality.
-  useEffect(() => {
-    void testConnection();
-  }, [testConnection]);
-
-  const uptimeMs = useMemo(() => Date.now() - sessionStart, [sessionStart, runs]);
+  const runningCount = runs.filter((r) => r.status === "running").length;
+  const canRun =
+    connection.status === "connected" && buildMatrix(models, tests).length > 0;
 
   return {
     models,
@@ -391,8 +453,9 @@ export function useBenchSession() {
     pass,
     passTotal,
     passCompleted,
-    uptimeMs,
-    setPaused,
+    runningCount,
+    canRun,
+    togglePaused,
     runAdHoc,
     purgeRuns,
     addModel,
@@ -405,6 +468,6 @@ export function useBenchSession() {
     resetTestsToDefault,
     updateBaseUrl,
     testConnection,
-    runningCount: runningCountRef.current,
+    canRunAdHoc: canRun && runningCount < MAX_CONCURRENT,
   };
 }

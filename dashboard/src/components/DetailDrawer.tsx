@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import {
+  Ban,
   CheckCircle2,
   Clock3,
   Cpu,
@@ -10,18 +11,14 @@ import {
   XCircle,
   Zap,
 } from "lucide-react";
-import type { ModelDef, RunResult, TestDef } from "../types";
+import type { RunResult } from "../types";
 import { formatMs, formatTokS } from "../utils/format";
 
 export default function DetailDrawer({
   run,
-  model,
-  test,
   onClose,
 }: {
   run: RunResult | null;
-  model?: ModelDef;
-  test?: TestDef;
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -33,6 +30,8 @@ export default function DetailDrawer({
   }, [onClose]);
 
   const open = !!run;
+  const model = run?.model;
+  const test = run?.test;
 
   return (
     <div
@@ -61,7 +60,12 @@ export default function DetailDrawer({
                   {run.status === "success" && (
                     <CheckCircle2 className="h-4 w-4 text-emerald-400" />
                   )}
-                  {run.status === "error" && <XCircle className="h-4 w-4 text-rose-400" />}
+                  {run.status === "error" && (
+                    <XCircle className="h-4 w-4 text-rose-400" />
+                  )}
+                  {run.status === "cancelled" && (
+                    <Ban className="h-4 w-4 text-slate-400" />
+                  )}
                   <span className="rounded-full bg-white/5 px-2 py-0.5 text-[11px] font-semibold text-slate-300">
                     {test.code}
                   </span>
@@ -74,11 +78,6 @@ export default function DetailDrawer({
                   >
                     {test.category}
                   </span>
-                  {run.simulated && (
-                    <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
-                      simulated sample
-                    </span>
-                  )}
                 </div>
                 <h3 className="mt-1.5 truncate text-lg font-semibold text-white">
                   {model.name}
@@ -87,6 +86,7 @@ export default function DetailDrawer({
               </div>
               <button
                 onClick={onClose}
+                aria-label="Close run details"
                 className="shrink-0 rounded-lg border border-white/10 bg-white/5 p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
               >
                 <X className="h-4 w-4" />
@@ -95,23 +95,45 @@ export default function DetailDrawer({
 
             <div className="grid grid-cols-2 gap-3 border-b border-white/10 p-5 sm:grid-cols-4">
               <Metric icon={Zap} label="TTFT" value={formatMs(run.ttftMs)} />
-              <Metric icon={Gauge} label="Throughput" value={formatTokS(run.tokensPerSec)} />
-              <Metric icon={Clock3} label="Duration" value={formatMs(run.durationMs)} />
+              <Metric
+                icon={Gauge}
+                label="Throughput"
+                value={formatTokS(run.tokensPerSec)}
+              />
+              <Metric
+                icon={Clock3}
+                label="Duration"
+                value={formatMs(run.durationMs)}
+              />
               <Metric
                 icon={Hash}
                 label="Tokens"
-                value={run.tokensGenerated?.toLocaleString() ?? "â"}
+                value={run.tokensGenerated?.toLocaleString() ?? "—"}
               />
             </div>
 
             <div className="flex-1 space-y-5 overflow-y-auto p-5">
+              <p className="break-all text-[11px] text-slate-500">
+                API server: {run.baseUrl}
+              </p>
+              {run.status === "success" &&
+                (run.tokensGenerated === undefined ||
+                  run.ttftMs === undefined ||
+                  run.tokensPerSec === undefined) && (
+                  <p className="rounded-lg border border-white/10 p-3 text-xs text-slate-400">
+                    A dash means the measurement is unavailable. Token counts
+                    require API usage data; TTFT requires streaming, and
+                    throughput requires usage plus a measurable stream
+                    generation interval. No estimates are substituted.
+                  </p>
+                )}
               <div>
                 <div className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">
                   <Cpu className="h-3.5 w-3.5" /> Prompt
                 </div>
                 <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 text-sm leading-relaxed text-slate-300">
                   {test.prompt}
-                  {test.inputs && (
+                  {test.category === "vision" && test.inputs && (
                     <div className="mt-3 flex flex-wrap gap-1.5">
                       {test.inputs.map((input) => (
                         <span
@@ -141,7 +163,7 @@ export default function DetailDrawer({
                     ))}
                   </div>
                 )}
-                {run.status === "error" && (
+                {(run.status === "error" || run.status === "cancelled") && (
                   <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 p-3 text-sm text-rose-300">
                     {run.error}
                   </div>
@@ -181,7 +203,9 @@ function Metric({
       <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-slate-500">
         <Icon className="h-3 w-3" /> {label}
       </div>
-      <p className="mt-0.5 font-mono text-sm font-semibold text-slate-100">{value}</p>
+      <p className="mt-0.5 font-mono text-sm font-semibold text-slate-100">
+        {value}
+      </p>
     </div>
   );
 }

@@ -9,6 +9,7 @@ import {
   YAxis,
 } from "recharts";
 import type { RunResult, TestDef } from "../types";
+import { average } from "../utils/metrics";
 
 export default function DurationChart({
   tests,
@@ -17,33 +18,41 @@ export default function DurationChart({
   tests: TestDef[];
   runs: RunResult[];
 }) {
-  const data = tests.map((t) => {
-    const successRuns = runs.filter(
-      (r) => r.testId === t.id && r.status === "success" && r.durationMs,
-    );
-    const avgTtft =
-      successRuns.length > 0
-        ? successRuns.reduce((s, r) => s + (r.ttftMs ?? 0), 0) / successRuns.length
-        : 0;
-    const avgTotal =
-      successRuns.length > 0
-        ? successRuns.reduce((s, r) => s + (r.durationMs ?? 0), 0) / successRuns.length
-        : 0;
-    const avgGen = Math.max(0, avgTotal - avgTtft);
-    return {
-      code: t.code,
-      category: t.category,
-      ttft: Math.round(avgTtft),
-      generation: Math.round(avgGen),
-      samples: successRuns.length,
-    };
-  });
+  const data = tests
+    .map((test) => {
+      const measured = runs.filter(
+        (run) =>
+          run.testId === test.id &&
+          run.status === "success" &&
+          run.durationMs !== undefined,
+      );
+      const total = average(measured.map((run) => run.durationMs));
+      // Do not portray missing TTFTs as zero-latency measurements. Show the
+      // measured total only if a complete breakdown is not available.
+      const hasBreakdown =
+        measured.length > 0 &&
+        measured.every((run) => run.ttftMs !== undefined);
+      const ttft = hasBreakdown
+        ? average(measured.map((run) => run.ttftMs))
+        : undefined;
+      return {
+        code: test.code,
+        ttft: ttft === undefined ? undefined : Math.round(ttft),
+        generation:
+          ttft !== undefined && total !== undefined
+            ? Math.round(Math.max(0, total - ttft))
+            : undefined,
+        total:
+          !hasBreakdown && total !== undefined ? Math.round(total) : undefined,
+        samples: measured.length,
+      };
+    })
+    .filter((entry) => entry.samples > 0);
 
-  const hasData = data.some((d) => d.samples > 0);
-  if (!hasData) {
+  if (data.length === 0) {
     return (
       <div className="flex h-72 items-center justify-center text-sm text-slate-500">
-        Waiting for the first completed runsâ¦
+        No duration measurements yet.
       </div>
     );
   }
@@ -51,7 +60,11 @@ export default function DurationChart({
   return (
     <ResponsiveContainer width="100%" height={300}>
       <BarChart data={data} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#ffffff12" vertical={false} />
+        <CartesianGrid
+          strokeDasharray="3 3"
+          stroke="#ffffff12"
+          vertical={false}
+        />
         <XAxis
           dataKey="code"
           tick={{ fill: "#cbd5e1", fontSize: 11 }}
@@ -76,13 +89,26 @@ export default function DurationChart({
         />
         <Legend
           wrapperStyle={{ fontSize: 11, color: "#94a3b8" }}
-          formatter={(v) => (v === "ttft" ? "Time to first token" : "Generation time")}
+          formatter={(value) =>
+            value === "ttft"
+              ? "Time to first token"
+              : value === "generation"
+                ? "Time after first token"
+                : "Total (TTFT unavailable)"
+          }
         />
-        <Bar dataKey="ttft" stackId="a" fill="#22d3ee" radius={[0, 0, 0, 0]} maxBarSize={46} />
+        <Bar dataKey="ttft" stackId="a" fill="#22d3ee" maxBarSize={46} />
         <Bar
           dataKey="generation"
           stackId="a"
           fill="#6366f1"
+          radius={[6, 6, 0, 0]}
+          maxBarSize={46}
+        />
+        <Bar
+          dataKey="total"
+          stackId="a"
+          fill="#94a3b8"
           radius={[6, 6, 0, 0]}
           maxBarSize={46}
         />

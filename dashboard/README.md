@@ -1,97 +1,136 @@
-# Jan Bench Analytics — LLM Performance Dashboard
+# Jan Bench Analytics
 
-A benchmark dashboard that profiles LLM throughput across a model roster by
-executing real streaming chat completions against any OpenAI-compatible API
-server (Jan, llama.cpp, LM Studio, vLLM, …). When no server is reachable it
-falls back to an offline simulator so the UI stays explorable.
+Benchmark real OpenAI-compatible API requests against Jan, llama.cpp, LM Studio,
+or another inference server. **There is no sample data, seeded model roster,
+simulator, or offline fallback.**
 
-## Quick start
+## Run locally with Jan
+
+On the **same machine as Jan**:
 
 ```bash
+cd dashboard                 # from the repository root
 npm ci
-
-# Terminal 1 — the benchmark API. Use the bundled mock, or skip this and point
-# API_UPSTREAM at your own server (below).
-npm run mock          # OpenAI-compatible server on http://127.0.0.1:1337
-
-# Terminal 2 — the dashboard
-npm run dev           # http://localhost:5173
+npm run dev
 ```
 
-Open the dashboard — the connection pill should flip to **Live** and the
-rotation starts recording real completions from the API server.
+1. Enable Jan's local API server. Its default base URL is
+   **`http://127.0.0.1:1337/v1`** — HTTP, not HTTPS.
+2. Open the dashboard at `http://localhost:5173`.
+3. Open the single **Server & models** header button and click **Test connection**.
+   Only the model IDs returned by `/v1/models` are loaded; no engine metadata or
+   performance profiles are invented.
+4. Close settings, then choose **Start benchmarks** to cycle through enabled
+   models and tests. Or select a model and test under **Run Ad-hoc Test** and
+   click **Run now** for one request.
 
-## Pointing the dashboard at your own API server
+A new page starts **empty and idle**: no results, models, connection probe,
+benchmark requests, running animation, or automatic rotation. The included
+text prompts are editable _test definitions_, not completed tests or results.
+Even a successful connection check **does not start benchmarks**.
 
-The app talks to the relative path `/api`, which the Vite dev server proxies to
-your benchmark API. This avoids browser CORS and mixed-content blocks entirely.
-To target a different server (e.g. a Jan instance on another machine):
+## Server URL and proxy
+
+Browser requests use the same-origin `/api` proxy. Its default upstream is
+`http://127.0.0.1:1337/v1`; paths with or without the trailing `/v1` are accepted.
+This avoids browser CORS and mixed-content issues and avoids confusing the
+browser's localhost with the dashboard host's localhost.
+
+To point the proxy at a different Jan/API server, restart the dashboard:
 
 ```bash
-API_UPSTREAM=http://192.168.1.50:1337 npm run dev
+API_UPSTREAM=http://192.168.1.50:1337/v1 npm run dev
 ```
 
-(Default target: `http://127.0.0.1:1337`, Jan's default port.)
+The configured upstream becomes the default URL shown in settings. Entering a
+different absolute URL in the UI will explain how to reconfigure the proxy;
+it **never silently sends a request to some other upstream**. A relative base
+URL is also supported if you deploy a same-origin reverse proxy yourself.
 
-Alternatively, paste an absolute URL into **Server & models → API Server** in
-the UI; then the browser calls it directly, so the server must send CORS
-headers. The relative `/api` proxy has no such requirement.
+**The hosted Arena preview cannot reach Jan on your computer at `127.0.0.1`.**
+Run the dashboard locally with Jan, or host it on a machine with authorized
+network access to your API. Do not expose your private Jan server publicly just
+to connect the preview.
 
-## Live vs. simulated mode
+`npm run preview` also supports the proxy. For a standalone deployment of
+`dist/index.html`, provide a reverse proxy for `/api/v1/*`; the single HTML file
+does not contain a server. Build and serve with the same `API_UPSTREAM` value
+so the displayed target and actual routing agree.
 
-- The dashboard probes `/v1/models` on startup (and from **Test connection**).
-- **Connected:** both the background rotation and ad-hoc *Run now* tests POST
-  real streamed `/v1/chat/completions` requests and record measured TTFT,
-  tokens/sec, and duration from the stream (`usage` chunk when provided,
-  otherwise estimated). Runs are tagged live; nothing is simulated.
-- **Unreachable:** the offline simulator keeps producing sample telemetry so
-  you can explore the UI. Simulated results carry a small **SIM** badge in the
-  feed and detail drawer.
-- If the server drops mid-run, the run is marked failed and the dashboard
-  falls back to simulated telemetry until the next successful probe.
+## What counts as benchmark data
 
-For live runs the request's `model` field is the roster entry's id, so custom
-models you add should use the exact id your server reports under `/v1/models`.
+- Both rotation and ad-hoc runs send actual `POST /v1/chat/completions` requests
+  with the selected model ID and prompt. Results are recorded only for these
+  dispatched requests, including their actual HTTP/network failures.
+- **TTFT** is measured from request start to receipt of the first content chunk.
+- **Token count** comes only from the server's `usage.completion_tokens`.
+  Characters are never converted into estimated tokens.
+- **Throughput** uses that reported count and the observed interval between the
+  first and last content-bearing network reads. Buffered or single-chunk
+  responses cannot supply a meaningful generation rate.
+- **Duration** is measured wall-clock request time. If the server returns
+  non-streamed JSON, duration and any reported usage are retained, but TTFT and
+  generation throughput are unavailable.
+- Missing metrics display **—**, not zero, and are omitted from averages.
+  Untested models are not ranked. API success rate measures request success,
+  **not the correctness or quality of the model's answer**.
+- The feed and detail drawer retain the exact model, test prompt, inputs, and
+  server URL used for the request, even if settings change later.
 
-## Purging run data
+A failed request stops rotation and requires another successful connection
+check before more tests can be sent. Already-dispatched requests may finish;
+no replacement results are generated. **Pause rotation** prevents new requests
+but lets in-flight work finish. Reconnecting does not automatically resume.
 
-**Purge data** (top bar) wipes every recorded result — the seeded sample data
-plus anything collected since — and resets the stat cards, charts, leaderboard,
-and feed to zero. In-flight runs are aborted. The model roster, test suite,
-server settings, and rotation schedule are untouched, so the dashboard
-immediately starts filling with fresh (live, if connected) data.
+Up to two requests can be in flight. Each request has a 180-second total limit,
+a 60-second stream-idle limit, and an editable output-token cap of 1–4,000.
+Incomplete prompts are skipped. Vision tests require actual image URLs or image
+data URLs, sent as `image_url` message parts to a vision-capable model; local
+filenames and unattached sample images are not treated as test inputs.
 
-## Testing the API contract (headless)
+## Purging results
+
+**Purge data** clears recorded runs, metrics, charts, the leaderboard, and feed.
+It cancels in-flight requests and resets pass progress. Late responses cannot
+restore purged results. Your model roster, prompt definitions, server settings,
+and rotation choice are preserved. If you already started rotation, it continues
+with **new real API requests** while connected. Pause rotation before purging if
+you want the board to stay empty. Purging an idle session never starts rotation.
+
+Results and configuration are in memory only. Reloading starts a new blank
+session; no prior sample data is restored from browser storage.
+
+## Verification
 
 ```bash
-npm run test:api                      # against the mock at 127.0.0.1:1337
-node mock-server/smoke-test.mjs http://your-server:1337   # against your own server
+npm test                  # runner, scheduler, data-integrity, and UI regression tests
+npm run typecheck
+npm run build
+
+# Full browser checks (isolated API fixtures; no Jan instance needed):
+npx playwright install chromium
+npm run test:e2e
 ```
 
-Verifies `GET /v1/models`, streamed chat completions (TTFT, chunk flow, usage,
-`[DONE]`), and the non-streaming fallback — the same flow the app uses.
+The tests cover blank startup, no automatic probes/runs, failed connections,
+explicit execution, truthful missing metrics, model discovery, request limits,
+stream parsing, cancellations, stale probes, and purging without late results
+reappearing. Browser fixtures never become user-visible benchmark data.
 
-## Mock server
+### Optional API contract fixture
 
-`mock-server/server.mjs` (zero-dependency Node):
+The standalone mock is **only a development test fixture**, not an inference
+server. It uses port **1338**, deliberately different from Jan. It is never
+started or selected by the dashboard; the app rejects responses marked as coming
+from this bundled mock.
 
-- Serves the dashboard roster's model ids on `/v1/models`.
-- Streams `text/event-stream` completions with per-model tokens/sec pacing and
-  TTFT, honoring `max_tokens` (capped) and `stream_options.include_usage`.
-- Randomly fails ~6% of requests with HTTP 500 to exercise the error path;
-  send header `x-mock-no-fail: 1` to disable (the smoke test does).
-- Env: `PORT` (1337), `MOCK_FAILURE_RATE` (0.06), `MOCK_MAX_TOKENS` (800).
+```bash
+npm run mock              # separate terminal, synthetic API on port 1338
+npm run test:api           # contract checks against that fixture
+# Or check an actual server's API contract explicitly:
+node mock-server/smoke-test.mjs http://your-api-host:1337/v1
+```
 
-## Scripts
-
-| Command            | Purpose                                  |
-| ------------------ | ---------------------------------------- |
-| `npm run dev`      | Vite dev server with `/api` proxy        |
-| `npm run mock`     | Start the mock OpenAI-compatible server  |
-| `npm run test:api` | API contract smoke test                  |
-| `npm run typecheck`| `tsc --noEmit`                           |
-| `npm run build`    | Single-file production bundle in `dist/` |
-
-Operational notes: max 2 concurrent in-flight runs; each live run is capped at
-180 s wall-clock and 60 s of stream silence; per-request generation is capped
-at the test's `avgOutputTokens` (≤ 4000) so long-context tests stay bounded.
+Mock settings: `PORT=1338`, `MOCK_FAILURE_RATE=0.06`, `MOCK_MAX_TOKENS=800`.
+The smoke test disables random failure injection using `x-mock-no-fail: 1`.
+Synthetic fixture timings are not model benchmarks.

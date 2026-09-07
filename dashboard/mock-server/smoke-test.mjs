@@ -1,18 +1,22 @@
 #!/usr/bin/env node
 /**
  * Smoke test: verifies the API server speaks the OpenAI contract the
- * dashboard depends on — the exact flow the live benchmark runner uses.
+ * dashboard depends on — fixture transport behavior, not model performance.
  *
  *   node mock-server/smoke-test.mjs [baseUrl]
  *
- * Defaults to http://127.0.0.1:1337 (the mock server). Exit code 0 = all pass.
+ * Defaults to http://127.0.0.1:1338 (the mock server). Exit code 0 = all pass.
  */
-const BASE = (process.argv[2] || "http://127.0.0.1:1337").replace(/\/+$/, "");
+const BASE = (process.argv[2] || "http://127.0.0.1:1338")
+  .replace(/\/+$/, "")
+  .replace(/\/v1$/, "");
 
 let failures = 0;
 
 function check(name, ok, detail = "") {
-  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
+  console.log(
+    `${ok ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`,
+  );
   if (!ok) failures += 1;
 }
 
@@ -29,7 +33,11 @@ async function main() {
     check("GET /v1/models returns 200", res.ok, `HTTP ${res.status}`);
     const data = await res.json();
     models = Array.isArray(data?.data) ? data.data.map((m) => m.id) : [];
-    check("model list is a non-empty array", models.length > 0, `${models.length} model(s)`);
+    check(
+      "model list is a non-empty array",
+      models.length > 0,
+      `${models.length} model(s)`,
+    );
   } catch (err) {
     check("GET /v1/models reachable", false, err.message);
     console.log("\nIs the server running? Try: npm run mock");
@@ -52,7 +60,11 @@ async function main() {
     try {
       const res = await fetch(`${BASE}/v1/chat/completions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...NO_FAIL_HEADER },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          ...NO_FAIL_HEADER,
+        },
         body: JSON.stringify({
           model,
           messages: [{ role: "user", content: prompt }],
@@ -61,7 +73,11 @@ async function main() {
           stream_options: { include_usage: true },
         }),
       });
-      check("POST /v1/chat/completions returns 200", res.ok, `HTTP ${res.status}`);
+      check(
+        "POST /v1/chat/completions returns 200",
+        res.ok,
+        `HTTP ${res.status}`,
+      );
       check(
         "response is text/event-stream",
         (res.headers.get("content-type") || "").includes("text/event-stream"),
@@ -106,19 +122,39 @@ async function main() {
     const ttft = firstTokenAt === null ? null : Math.round(firstTokenAt - t0);
     const totalMs = lastChunkAt === null ? null : Math.round(lastChunkAt - t0);
     check("streamed chunks received", chunks > 0, `${chunks} chunks`);
-    check("TTFT captured from first content chunk", ttft !== null, ttft !== null ? `${ttft} ms` : "none");
     check(
-      "TTFT plausible (< 2s)",
-      ttft !== null && ttft < 2000,
+      "TTFT captured from first content chunk",
+      ttft !== null,
+      ttft !== null ? `${ttft} ms` : "none",
+    );
+    check(
+      "TTFT is a measured non-negative duration",
+      ttft !== null && ttft >= 0,
       ttft !== null ? `${ttft} ms` : "n/a",
     );
-    check("completion text accumulated", text.length > 0, `${text.length} chars`);
-    check("usage chunk present with completion_tokens", usage?.completion_tokens > 0, JSON.stringify(usage));
+    check(
+      "completion text accumulated",
+      text.length > 0,
+      `${text.length} chars`,
+    );
+    check(
+      "usage chunk present with completion_tokens",
+      usage?.completion_tokens > 0,
+      JSON.stringify(usage),
+    );
     check("stream terminated with [DONE]", sawDone);
-    const genSec = firstTokenAt !== null && lastChunkAt !== null ? (lastChunkAt - firstTokenAt) / 1000 : null;
-    const tokPerSec = usage?.completion_tokens && genSec ? (usage.completion_tokens / genSec).toFixed(1) : "?";
+    const genSec =
+      firstTokenAt !== null && lastChunkAt !== null
+        ? (lastChunkAt - firstTokenAt) / 1000
+        : null;
+    const tokPerSec =
+      usage?.completion_tokens && genSec
+        ? (usage.completion_tokens / genSec).toFixed(1)
+        : "?";
     if (totalMs !== null) {
-      console.log(`      total wall time ${totalMs} ms · ~${tokPerSec} tok/s (measured)\n`);
+      console.log(
+        `      total wall time ${totalMs} ms · ~${tokPerSec} tok/s (measured)\n`,
+      );
     }
   }
 
@@ -137,7 +173,11 @@ async function main() {
       check("non-streaming POST returns 200", res.ok, `HTTP ${res.status}`);
       const data = await res.json();
       const content = data?.choices?.[0]?.message?.content ?? "";
-      check("JSON completion has message content", content.length > 0, `${content.length} chars`);
+      check(
+        "JSON completion has message content",
+        content.length > 0,
+        `${content.length} chars`,
+      );
       check(
         "JSON completion reports usage",
         data?.usage?.completion_tokens > 0,
@@ -148,7 +188,11 @@ async function main() {
     }
   }
 
-  console.log(failures === 0 ? "\nAPI contract OK — dashboard live mode can use this server." : `\n${failures} check(s) failed.`);
+  console.log(
+    failures === 0
+      ? "\nAPI contract checks passed. Mock responses are synthetic and are rejected by the dashboard."
+      : `\n${failures} check(s) failed.`,
+  );
   process.exit(failures === 0 ? 0 : 1);
 }
 

@@ -1,11 +1,11 @@
 export function formatMs(ms?: number): string {
-  if (ms === undefined || Number.isNaN(ms)) return "â";
+  if (ms === undefined || Number.isNaN(ms)) return "—";
   if (ms < 1000) return `${Math.round(ms)} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
 export function formatTokS(v?: number): string {
-  if (v === undefined || Number.isNaN(v)) return "â";
+  if (v === undefined || Number.isNaN(v)) return "—";
   return `${v.toFixed(1)} tok/s`;
 }
 
@@ -17,7 +17,7 @@ export function formatNumber(v: number, digits = 0): string {
 }
 
 export function formatRelativeTime(ts?: number): string {
-  if (!ts) return "â";
+  if (!ts) return "—";
   const diff = Date.now() - ts;
   if (diff < 1000) return "just now";
   if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
@@ -37,5 +37,5 @@ export function formatUptime(ms: number): string {
 
 export function truncate(text: string, max = 90): string {
   if (text.length <= max) return text;
-  return `${text.slice(0, max).trimEnd()}â¦`;
+  return `${text.slice(0, max).trimEnd()}…`;
 }
