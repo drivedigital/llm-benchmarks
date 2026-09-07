@@ -36,6 +36,31 @@ Browser requests use the same-origin `/api` proxy. Its default upstream is
 This avoids browser CORS and mixed-content issues and avoids confusing the
 browser's localhost with the dashboard host's localhost.
 
+### Jan's `Origin '' is not trusted` warning
+
+The browser calls `/api/v1/models` and `/api/v1/chat/completions` on the
+**dashboard's origin**, not Jan's absolute URL. Vite strips `/api` and forwards
+them to Jan. Same-origin GETs commonly omit `Origin`, and `changeOrigin: true`
+changes the upstream `Host` header, **not** the HTTP `Origin` header.
+
+The proxy therefore explicitly supplies `Origin: http://127.0.0.1:1337` by
+default. This value is derived from `API_UPSTREAM` (scheme, host, and port only;
+never `/v1` or another path) and replaces any incoming browser origin on the
+server-to-server hop. This applies to both `npm run dev` and `npm run preview`,
+for model discovery and streamed completions. Browser requests stay same-origin;
+no frontend `Origin` override, `mode: "no-cors"`, TLS-verification bypass, or
+wildcard Jan allowlist is needed.
+
+After pulling a proxy configuration change, restart Vite. If the warning
+persists, check the browser's Network panel: requests should go to the
+**dashboard port** at `/api/v1/...`, not directly to Jan's port 1337. Open the
+app through Vite (or your configured reverse proxy), not the HTML file directly.
+A log saying that Jan did not reflect an origin is not by itself proof of a
+failed request; inspect the actual HTTP status and response. Same-origin browser
+requests do not depend on Jan's cross-origin approval headers.
+
+### Choosing a different API server
+
 To point the proxy at a different Jan/API server, restart the dashboard:
 
 ```bash

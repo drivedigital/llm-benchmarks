@@ -28,6 +28,12 @@ const proxy = {
     // Browser paths include /v1. Accept upstreams with or without that suffix.
     target: API_UPSTREAM.replace(/\/v1$/, ""),
     changeOrigin: true,
+    // changeOrigin rewrites Host, not Origin. Same-origin GETs often omit
+    // Origin entirely; POSTs may carry the dashboard's localhost/LAN/preview
+    // origin. Send a consistent server-side Origin that matches the configured
+    // API instead, so Jan's trusted-host check does not receive an empty or
+    // unrelated origin. URL.origin excludes /v1 (and any other API path).
+    headers: { origin: upstream.origin },
     rewrite: (p: string) => p.replace(/^\/api/, ""),
   },
 };
